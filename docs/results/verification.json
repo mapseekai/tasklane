@@ -1,0 +1,29 @@
+{
+  "date": "2026-09-24",
+  "commands": {
+    "typecheck": "passed",
+    "format": "passed",
+    "lint": "passed",
+    "packageDryRun": "passed",
+    "packageInstalledSmoke": "passed"
+  },
+  "unit": {
+    "tests": 78,
+    "passed": 78,
+    "failed": 0,
+    "skipped": 0
+  },
+  "browser": {
+    "passed": 33,
+    "failed": 0,
+    "flaky": 0,
+    "skipped": 0,
+    "engines": ["Chrome 153.0.8010.53", "Playwright Firefox 155.0", "Playwright WebKit 26.6"]
+  },
+  "stress": {
+    "tests": 4,
+    "passed": 4,
+    "failed": 0,
+    "skipped": 0
+  }
+}

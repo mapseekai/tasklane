@@ -1,0 +1,64 @@
+{
+  "name": "@mapseekai/worker-runtime",
+  "version": "0.1.0",
+  "description": "A bounded, scoped Worker runtime for interactive applications and large binary data processing",
+  "type": "module",
+  "license": "MIT",
+  "author": "mapseekai",
+  "packageManager": "pnpm@11.15.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./host": {
+      "types": "./dist/host.d.ts",
+      "import": "./dist/host.js"
+    },
+    "./node": {
+      "types": "./dist/adapters/node.d.ts",
+      "import": "./dist/adapters/node.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    "docs"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.contracts.json --noEmit",
+    "test": "pnpm build && node --test --test-concurrency=1 test/*.test.mjs",
+    "test:browser": "pnpm build && playwright test",
+    "test:stress": "pnpm build && node --test --test-concurrency=1 test/stress/*.test.mjs",
+    "benchmark": "pnpm build && node benchmarks/node.mjs",
+    "benchmark:browser": "pnpm build && node benchmarks/browser.mjs",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "lint": "biome lint .",
+    "verify": "pnpm typecheck && pnpm format:check && pnpm lint && pnpm test && pnpm test:browser && pnpm test:package",
+    "prepack": "pnpm build",
+    "dev": "pnpm build && node scripts/server.mjs",
+    "test:package": "node scripts/package-smoke.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mapseekai/worker-runtime.git"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.14",
+    "@playwright/test": "1.63.0",
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3"
+  }
+}

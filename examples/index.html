@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Worker Runtime · 大数据转换</title><link rel="stylesheet" href="./style.css"></head>
+<body><main><p>WORKER RUNTIME / 独立演示</p><h1>有界的大数据坐标转换</h1>
+<p>生成确定性 Float64 经纬度，转换为 Web Mercator 高低位 Float32。每块 4 MiB，结果消费后归还额度，不创建完整大文件。</p>
+<label>累计输入 <select id="size"><option value="64">64 MiB</option><option value="256">256 MiB</option><option value="1024">1 GiB</option></select></label>
+<label>Worker 数 <select id="workers"><option>1</option><option selected>2</option><option>4</option></select></label>
+<button id="start" type="button">开始转换</button><button id="cancel" type="button" disabled>取消</button>
+<p id="heartbeat" aria-live="off">页面心跳</p><progress id="progress" max="100" value="0"></progress>
+<pre id="status" aria-live="polite">准备就绪。此示例不创建 GPU 设备，也没有接入 emap。</pre>
+</main><script type="module" src="./main.mjs"></script></body></html>

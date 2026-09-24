@@ -1,133 +1,498 @@
-# API 参考（0.1.0）
+# API 参考
 
-## 包入口
+## 1. 包入口
 
-| 入口 | 内容 |
+| 入口 | 能力 |
 | --- | --- |
-| `@mapseekai/worker-runtime` | createWorkerRuntime、RuntimeScope、WorkerSession、browserWorker、binaryByteLength、transferBuffers、RuntimeError、公共类型 |
-| `/host` | serve、output、browserHost、HostContext、TaskHandlers、ScopedCache |
-| `/node` | nodeWorker、nodeHost；只有此入口导入 node:worker_threads |
-| `/testing` | createLoopback；同域 structuredClone 测试端点，不能用于测量并行性能 |
+| `@mapseekai/worker-runtime` | Runtime、Scope、Session、浏览器 Worker 工厂、二进制工具、公共类型 |
+| `@mapseekai/worker-runtime/host` | Worker Host、任务注册、TaskContext、Worker 本地缓存 |
+| `@mapseekai/worker-runtime/node` | Node.js `worker_threads` 适配器 |
+| `@mapseekai/worker-runtime/testing` | 基于 `structuredClone` 的同域测试端点 |
 
-## createWorkerRuntime(options)
-
-类型映射 `type Tasks = { name: TaskType<Input, Output> }` 同时约束主线程任务名、prepare 的输入类型以及 Host 返回类型。消息边界仍需任务函数校验业务字段；TypeScript 不等于运行时数据校验。
-
-| 配置 | 默认值 | 说明 |
-| --- | --- | --- |
-| pools | 必填 | 名称到 PoolOptions 的映射；至少一个池 |
-| maxWorkers | 所有池 size 之和 | 本 Runtime 所有常驻/关闭中物理槽上限 |
-| maxActiveTasks | min(所有池容量, 2) | 同时初始化等待/prepare/运行的任务上限 |
-| maxQueuedTasks | 1024 | 等待准入的任务数上限；不是数据字节上限 |
-| budgets.inputBytes | 64 MiB | 已准入输入数据预留总量 |
-| budgets.scratchBytes | 128 MiB | 调用者声明的执行暂存预留总量 |
-| budgets.outputBytes | 64 MiB | 执行中输出预留与未消费结果预留总量 |
-| budgets.cacheBytes | 128 MiB | 活着的 Worker 固定缓存容量总预留 |
-| startupTimeoutMs | 10000 | 单 Worker 协议握手上限 |
-| queueTimeoutMs | 120000 | 默认排队截止时间 |
-| executionTimeoutMs | 120000 | 获得准入至物理执行完成的上限 |
-| ageingMs | 2000 | 等待满此间隔提升一级准入优先级 |
-| maxAffinityEntries | 4096 | 软亲和性历史上限 |
-| onDiagnostic | 无 | 诊断回调；抛错不会破坏执行器生命周期 |
-
-所有大小、数量与毫秒值要求安全整数；数量必须正数；字节数可为零；超时必须大于零。缓存上限和队列上限不是“文件大小上限”。
-
-## PoolOptions
-
-`factory(): WorkerEndpoint` 每次必须返回全新的物理端点，不允许两个槽共享同一 Worker。`size` 是该池容量；`cacheBytes` 默认 0，`cacheEntries` 默认 4096；`allowHardCancel` 默认 false；`idleTimeoutMs` 默认 30000，0 表示保留空闲 Worker。
-
-`browserWorker(url, options?)` 返回工厂，默认 module Worker。`nodeWorker(url, options?)` 使用 Node Worker，避免把 node:worker_threads 打包进入浏览器。
-
-## Scope
-
-`runtime.createScope(label?)` 创建根作用域；`scope.createScope(label?)` 创建子作用域。label 只供人识别，同名不会产生身份别名。`scope.id` 唯一，`scope.closed` 表示已禁止新任务。
-
-`scope.dispose(): Promise<void>` 幂等：取消自己和子作用域的任务，释放结果和会话，通知 Worker 回收缓存，等待物理任务结束。普通共享 Worker 可继续为其他 Scope 工作。
-
-`runtime.dispose()` 关闭整个运行时并回收所有 Worker；端点终止失败明确 reject。不要忽略 dispose Promise。prepare 必须最终收敛，否则物理任务无法被外部证明完成。
-
-## scope.enqueue(name, options)
-
-必填 `pool`、`budget`、`prepare`。
+## 2. createWorkerRuntime
 
 ```ts
-{
-  pool: 'cpu',
-  budget: { inputBytes: 8 * MiB, scratchBytes: 16 * MiB, outputBytes: 8 * MiB },
-  prepare: async ({ signal }) => {
-    signal.throwIfAborted();
-    const packet = await makeOwnedPacket(signal);
-    return { payload: packet, transfer: transferBuffers(packet.coordinates) };
+const runtime = createWorkerRuntime({
+  pools: {
+    compute: {
+      factory: browserWorker('/workers/compute.js'),
+      size: 2,
+      cacheBytes: 32 * MiB,
+    },
   },
+});
+```
+
+主要配置：
+
+| 配置 | 默认值 | 作用 |
+| --- | ---: | --- |
+| `maxWorkers` | 所有 Pool size 之和 | Runtime 最大物理 Worker 数 |
+| `maxActiveTasks` | `min(pool capacity, 2)` | 同时处于准备或执行阶段的任务数 |
+| `maxQueuedTasks` | 1024 | 等待准入的任务数量 |
+| `budgets.inputBytes` | 64 MiB | 输入数据总额度 |
+| `budgets.scratchBytes` | 128 MiB | 算法暂存总额度 |
+| `budgets.outputBytes` | 64 MiB | 执行中和待消费结果总额度 |
+| `budgets.cacheBytes` | 128 MiB | Worker 长驻缓存总额度 |
+| `startupTimeoutMs` | 10000 | Worker 启动与协议握手超时 |
+| `queueTimeoutMs` | 120000 | 等待准入超时 |
+| `executionTimeoutMs` | 120000 | 执行阶段超时 |
+| `ageingMs` | 2000 | 等待任务优先级老化间隔 |
+| `maxAffinityEntries` | 4096 | 亲和性历史数量 |
+| `onDiagnostic` | — | 诊断事件回调 |
+
+## 3. PoolOptions
+
+```ts
+interface PoolOptions {
+  factory: () => WorkerEndpoint;
+  size: number;
+  cacheBytes?: number;
+  cacheEntries?: number;
+  allowHardCancel?: boolean;
+  idleTimeoutMs?: number;
+}
+```
+
+适用方式：
+
+```text
+compute pool     → 几何、投影、格式转换
+raster pool      → 解码、重采样、栅格计算
+font pool        → shaping、glyph 生成
+database pool    → 数据库 Session
+```
+
+### browserWorker
+
+```ts
+browserWorker(url, options?)
+```
+
+默认创建 module Worker。
+
+```ts
+factory: browserWorker(
+  new URL('./worker.js', import.meta.url),
+  { name: 'compute-worker' },
+)
+```
+
+### nodeWorker
+
+```ts
+import { nodeWorker } from '@mapseekai/worker-runtime/node';
+```
+
+用于 Node.js `worker_threads`。
+
+## 4. Scope
+
+创建根 Scope：
+
+```ts
+const scope = runtime.createScope('map-a');
+```
+
+创建子 Scope：
+
+```ts
+const source = scope.createScope('roads');
+```
+
+Scope 适合表达：
+
+- 地图实例
+- 数据集
+- 数据源
+- 文档
+- 插件
+- 工作区
+
+每个 Scope 拥有独立的任务、结果租约、Session 和 Worker 缓存命名空间。
+
+释放：
+
+```ts
+await scope.dispose();
+```
+
+## 5. enqueue
+
+```ts
+const handle = scope.enqueue('project', {
+  pool: 'compute',
   priority: 'interactive',
-  group: 'layer-1',
-  affinity: 'source-a/stable-shard-3',
+  group: 'roads',
+  affinity: 'source-a/shard-17',
   cancellation: 'cooperative',
   signal,
   queueTimeoutMs: 5000,
   executionTimeoutMs: 30000,
-  onProgress(value) { /* 更新轻量进度，不进行巨量同步转换 */ },
+  budget: {
+    inputBytes: 8 * MiB,
+    scratchBytes: 16 * MiB,
+    outputBytes: 8 * MiB,
+  },
+  prepare: ({ signal }) => {
+    signal.throwIfAborted();
+    const packet = createPacket();
+    return {
+      payload: packet,
+      transfer: transferBuffers(packet.coordinates),
+    };
+  },
+});
+```
+
+### priority
+
+```ts
+'tinteractive' | 'foreground' | 'background'
+```
+
+典型用途：
+
+| priority | 场景 |
+| --- | --- |
+| interactive | 当前视口、拖动后的补数据、实时交互 |
+| foreground | 用户主动分析、导入、导出 |
+| background | 预取、缓存构建、后台索引 |
+
+### group
+
+`group` 用于同一 Scope 内的公平调度，例如：
+
+```text
+layer-roads
+layer-buildings
+labels
+raster-tiles
+```
+
+### affinity
+
+`affinity` 提供软 Worker 亲和性：
+
+```ts
+affinity: 'dataset-a/chunk-42'
+```
+
+适合存在 Worker 本地缓存的可重建任务。
+
+### budget
+
+```ts
+budget: {
+  inputBytes,
+  scratchBytes,
+  outputBytes,
 }
 ```
 
-priority 默认为 foreground，可选 interactive/foreground/background。group 的公平性在 Scope 内分组。affinity 是软缓存偏好；不是严格会话。cancellation 默认为 cooperative。
+额度在任务准入时预留，使大规模任务保持有界并发。
 
-prepare 在准入后由主线程执行，闭包本身不会发送给 Worker。异步 prepare 应主动观察 signal；单纯 `await Promise.resolve()` 不会把执行权让给浏览器事件队列。大包复制应分块，并在真实任务队列让出时检查取消。
+### prepare
 
-## TaskHandle 与 ResultLease
+`prepare()` 在任务获得准入后调用。
 
-`handle.result: Promise<ResultLease<Output>>` 返回结果租约；`handle.cancel(reason?)` 可重复调用。`handle.state` 反映 queued/starting/preparing/running/cancelling/succeeded/failed/cancelled。
+适合在这里完成：
 
-`handle.settled: Promise<void>` 只表示物理占用终结，不表示调用成功。逻辑取消可能先于它很久发生。无法确认终止的自定义端点会被隔离，settled 不会假完成。
+- 创建精确大小 TypedArray
+- 从源模型复制当前分块
+- 编码 Worker 输入包
+- 收集 Transferable
 
-`handle.timing` 是快照：queueMs、startupMs、prepareMs、roundTripMs、workerMs、totalMs。roundTrip 包含消息交接，workerMs 是 Host 侧执行及结果准备，不能将二者相减当成精确的传输复制时间。多 Worker 的 workerMs 求和不等于墙钟耗时。
+## 6. TaskHandle
 
-`lease.value` 提供结果；`lease.byteLength` 是可计量的二进制 backing store 总量。`lease.release()` 幂等，之后访问 value 报 RESULT_RELEASED。预留上限直到 release 才归还；运行时不能清除调用者自己保存的数组引用。
+```ts
+interface TaskHandle<T> {
+  readonly id: string;
+  readonly state: TaskState;
+  readonly timing: TaskTiming;
+  readonly result: Promise<ResultLease<T>>;
+  readonly settled: Promise<void>;
+  cancel(reason?: unknown): void;
+}
+```
 
-GPU 集成须等上传端真正消费结果后再释放，而不是刚把 TypedArray 加入一个无界数组队列就释放额度。
+状态：
 
-## Session
+```text
+queued
+starting
+preparing
+running
+cancelling
+succeeded
+failed
+cancelled
+```
 
-`const session = scope.session('cpu')` 懒绑定独占 Worker。`session.enqueue(name, options)` 不再传 pool/affinity，其余与普通 enqueue 一致。
+### result
 
-`session.state` 为 unbound/bound/lost/closed。会话独占而非只固定路由，适合不可重入状态与可被单独终止的任务。过多会话可能占满物理容量，其他任务会等待或排队超时；不会自动偷走会话 Worker。
+```ts
+const result = await handle.result;
+```
 
-`session.dispose()` 取消会话任务、释放会话结果并终止其独占 Worker。Worker 丢失后，原 Session 不可再次调用；应由业务重建状态后新建 Session。
+### settled
 
-## Host
+```ts
+await handle.settled;
+```
 
-`serve(port, handlers)` 注册静态任务表并返回 Host 释放函数。任务处理器返回 `output(value, transfer?)`，可同步或异步。HostContext 提供 signal、scopeId、sessionId、epoch、cache、progress、checkpoint。
+`settled` 用于等待物理任务生命周期收敛，适合资源关闭、页面退出和任务替换流程。
 
-progress 最多每 16ms 发送一次，初次可以立即发送。checkpoint 使用真实 setTimeout 队列让出，检查信号，不声称能中断一个正在运行的同步 WASM 函数。
+### timing
 
-cache.get(key)、set(key,value,bytes)、setPinned(key,value,bytes)、delete(key) 自动采用当前 Scope/Session 命名空间。常驻预算不能小于实际 TypedArray backing store 大小。缓存内容属于缓存；发送结果前应复制为自有缓冲，**不要把缓存数组的底层 buffer 直接 transfer 导致缓存被 detach**。
+```ts
+handle.timing
+```
 
-## 二进制与输入约束
+包含：
 
-`transferBuffers(...buffersOrWholeViews)` 去重且要求完整拥有的 ArrayBuffer。传入 partial view、SharedArrayBuffer 会报错；原始数据仍被其他对象使用时不要调用它。Node Buffer 可能使用共享池，不应盲目 transfer 底层 buffer。
+```text
+queueMs
+startupMs
+prepareMs
+roundTripMs
+workerMs
+totalMs
+```
 
-`binaryByteLength` 支持 plain object、array、Map、Set、TypedArray、ArrayBuffer、SharedArrayBuffer，Date/RegExp 作为零二进制字节标量。拒绝 accessor/custom class/platform resource，以免隐藏无法计账的二进制成员。默认最多遍历 100000 个元数据对象/待遍历项；大量坐标必须改用 TypedArray。
+## 7. ResultLease
 
-SharedArrayBuffer 只提供计账，不提供同步、锁或无竞争语义。浏览器可用性由宿主部署环境决定；本版本不依赖 SharedArrayBuffer 或跨源隔离。
+```ts
+const lease = await handle.result;
 
-## 稳定错误码
+try {
+  consume(lease.value);
+} finally {
+  lease.release();
+}
+```
 
-| 错误码 | 含义与处理 |
+属性：
+
+```ts
+lease.value
+lease.byteLength
+lease.released
+```
+
+ResultLease 适合：
+
+- 分块流水线
+- 异步写盘
+- 网络上传
+- 后续转换
+- 渐进消费
+
+结果额度在 `release()` 后归还 Runtime。
+
+## 8. Session
+
+```ts
+const session = scope.session('database');
+```
+
+Session 独占一个物理 Worker，适合状态型执行环境。
+
+```ts
+await session.enqueue('open', {
+  budget,
+  prepare: () => ({ payload: config }),
+}).result;
+
+await session.enqueue('query', {
+  budget,
+  prepare: () => ({ payload: sql }),
+}).result;
+```
+
+状态：
+
+```text
+unbound
+bound
+lost
+closed
+```
+
+适用场景：
+
+- DuckDB
+- SQLite
+- GDAL dataset
+- 长驻 WASM 实例
+- 带内部状态的解析器
+
+释放：
+
+```ts
+await session.dispose();
+```
+
+## 9. Worker Host
+
+Worker 入口：
+
+```ts
+import {
+  browserHost,
+  output,
+  serve,
+} from '@mapseekai/worker-runtime/host';
+
+serve(browserHost(self), {
+  project(input, ctx) {
+    const result = projectCoordinates(input);
+    return output(result, [result.buffer]);
+  },
+});
+```
+
+## 10. HostContext
+
+任务处理器可以使用：
+
+```ts
+ctx.signal
+ctx.scopeId
+ctx.sessionId
+ctx.epoch
+ctx.cache
+ctx.progress(value)
+await ctx.checkpoint()
+```
+
+### progress
+
+```ts
+ctx.progress({ completed, total });
+```
+
+进度消息按物理任务进行节流，适合大循环和分阶段算法。
+
+### checkpoint
+
+```ts
+for (let i = 0; i < items.length; i++) {
+  process(items[i]);
+
+  if ((i & 8191) === 0) {
+    await ctx.checkpoint();
+  }
+}
+```
+
+适合实现协作式取消。
+
+## 11. Worker Cache
+
+```ts
+ctx.cache.get(key)
+ctx.cache.set(key, value, bytes)
+ctx.cache.setPinned(key, value, bytes)
+ctx.cache.delete(key)
+```
+
+普通缓存采用 LRU。
+
+典型缓存：
+
+- 三角化结果
+- 索引
+- 解码块
+- 字体数据
+- 计算中间结构
+
+Session 可使用 `setPinned()` 保存长期状态。
+
+## 12. Transferable
+
+```ts
+const bytes = new Uint8Array(size);
+
+return {
+  payload: bytes,
+  transfer: transferBuffers(bytes),
+};
+```
+
+`transferBuffers()` 支持：
+
+- `ArrayBuffer`
+- 覆盖完整 backing store 的 TypedArray
+- 去重
+- 显式所有权转移
+
+适合大坐标数组、像素块和文件分片。
+
+## 13. binaryByteLength
+
+```ts
+binaryByteLength(value)
+```
+
+用于统计任务包中的二进制 backing store 大小。
+
+支持：
+
+- ArrayBuffer
+- SharedArrayBuffer
+- TypedArray
+- Array
+- plain object
+- Map
+- Set
+- Date
+- RegExp
+
+对同一 backing store 自动去重。
+
+## 14. RuntimeStats
+
+```ts
+runtime.stats
+```
+
+包含：
+
+```text
+queued
+active
+workers
+closingWorkers
+leases
+workerStarts
+workerTerminations
+inputBytes
+outputBytes
+cacheUsedBytes
+reserved
+peakReserved
+observerErrors
+```
+
+适合运行时监控、性能诊断和自动化基准记录。
+
+## 15. 错误码
+
+| 错误码 | 含义 |
 | --- | --- |
-| INVALID_ARGUMENT | 参数/对象类型/大小非法，修正输入 |
-| CLOSED | Runtime、Scope、Session 已关闭 |
-| QUEUE_FULL | 等待任务太多，减少上游并发 |
-| QUEUE_TIMEOUT | 等待准入超时，检查容量、未释放结果、会话占槽 |
-| STARTUP_TIMEOUT | Worker 资源/CSP/协议握手未完成 |
-| EXECUTION_TIMEOUT | 已准入任务超时；同步 prepare 仍需自行退出 |
-| BUDGET_EXCEEDED | 单任务/输入/输出/缓存预算不足；应减小包或显式调整预算 |
-| ABORTED | 调用取消；用 settled 等待物理结束 |
-| WORKER_FAILED | 端点失败、崩溃或终止失败；不可无条件重试有副作用任务 |
-| PROTOCOL_ERROR | 主包/Worker 版本或消息不符合协议 |
-| UNKNOWN_TASK | Host 没有注册对应任务，prepare 尚未执行 |
-| SESSION_LOST | 必需会话的 Worker 丢失，业务必须重建 |
-| HARD_CANCEL_DENIED | 该池未授权终止式取消 |
-| RESULT_RELEASED | 访问已释放结果 |
-| REMOTE_ERROR | 任务处理器抛出的业务/算法错误 |
-
-本库不自动重试数据写入或有外部副作用的任务。重试与幂等键应由业务决定。
+| `INVALID_ARGUMENT` | 配置或任务参数校验失败 |
+| `CLOSED` | Runtime / Scope / Session 已关闭 |
+| `QUEUE_FULL` | 等待队列达到上限 |
+| `QUEUE_TIMEOUT` | 等待准入达到截止时间 |
+| `STARTUP_TIMEOUT` | Worker 启动或握手达到截止时间 |
+| `EXECUTION_TIMEOUT` | 执行阶段达到截止时间 |
+| `BUDGET_EXCEEDED` | 资源额度达到上限 |
+| `ABORTED` | 任务取消 |
+| `WORKER_FAILED` | Worker 端点故障 |
+| `PROTOCOL_ERROR` | 协议校验失败 |
+| `UNKNOWN_TASK` | Worker Host 缺少任务实现 |
+| `SESSION_LOST` | Session 对应 Worker 失效 |
+| `HARD_CANCEL_DENIED` | Pool 配置未启用终止式取消 |
+| `RESULT_RELEASED` | ResultLease 已释放 |
+| `REMOTE_ERROR` | Worker 任务执行错误 |

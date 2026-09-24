@@ -2,8 +2,17 @@
 
 ## 0.1.0 — 2026-09-24
 
-Initial independent runtime: browser/Node adapters, scoped bounded scheduling,
-priority/ageing/fairness, explicit buffer ownership, output backpressure,
-physical cancellation accounting, sessions, worker-local caches, lifecycle
-metrics, protocol failure handling, real-browser tests and reproducible
-large-data conversion benchmarks. No emap integration or npm publication.
+Initial release of the bounded Worker runtime with:
+
+- browser Web Worker and Node.js worker_threads adapters
+- scoped lifecycle and bounded scheduling
+- priority, ageing and fair task admission
+- explicit Transferable ownership
+- input, scratch, output and cache budgets
+- ResultLease backpressure
+- cooperative, discard and terminate cancellation modes
+- worker affinity and stateful sessions
+- worker-local bounded caches
+- protocol generation and failure handling
+- runtime metrics and timing
+- browser, stress and large-data conversion verification

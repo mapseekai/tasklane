@@ -1,8 +1,8 @@
-# Worker Runtime 架构设计
+# tasklane 架构设计
 
 ## 1. 设计目标
 
-Worker Runtime 面向高计算量、大数据和高交互应用，统一管理：
+tasklane 面向高计算量、大数据和高交互应用，统一管理：
 
 - Worker 生命周期
 - 任务调度

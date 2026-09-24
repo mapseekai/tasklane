@@ -1,7 +1,7 @@
 import type { ErrorCode } from './errors.js';
 
 export const PROTOCOL_VERSION = 1;
-export const PROTOCOL_TAG = '@mapseekai/worker-runtime';
+export const PROTOCOL_TAG = '@mapseekai/tasklane';
 
 export interface Header {
   tag: typeof PROTOCOL_TAG;

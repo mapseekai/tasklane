@@ -4,10 +4,10 @@
 
 | 入口 | 能力 |
 | --- | --- |
-| `@mapseekai/worker-runtime` | Runtime、Scope、Session、浏览器 Worker 工厂、二进制工具、公共类型 |
-| `@mapseekai/worker-runtime/host` | Worker Host、任务注册、TaskContext、Worker 本地缓存 |
-| `@mapseekai/worker-runtime/node` | Node.js `worker_threads` 适配器 |
-| `@mapseekai/worker-runtime/testing` | 基于 `structuredClone` 的同域测试端点 |
+| `@mapseekai/tasklane` | Runtime、Scope、Session、浏览器 Worker 工厂、二进制工具、公共类型 |
+| `@mapseekai/tasklane/host` | Worker Host、任务注册、TaskContext、Worker 本地缓存 |
+| `@mapseekai/tasklane/node` | Node.js `worker_threads` 适配器 |
+| `@mapseekai/tasklane/testing` | 基于 `structuredClone` 的同域测试端点 |
 
 ## 2. createWorkerRuntime
 
@@ -81,7 +81,7 @@ factory: browserWorker(
 ### nodeWorker
 
 ```ts
-import { nodeWorker } from '@mapseekai/worker-runtime/node';
+import { nodeWorker } from '@mapseekai/tasklane/node';
 ```
 
 用于 Node.js `worker_threads`。
@@ -342,7 +342,7 @@ import {
   browserHost,
   output,
   serve,
-} from '@mapseekai/worker-runtime/host';
+} from '@mapseekai/tasklane/host';
 
 serve(browserHost(self), {
   project(input, ctx) {

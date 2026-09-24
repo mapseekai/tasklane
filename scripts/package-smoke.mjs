@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 const execute = promisify(execFile);
-const directory = await mkdtemp(join(tmpdir(), 'worker-runtime-package-'));
+const directory = await mkdtemp(join(tmpdir(), 'tasklane-package-'));
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const root = new URL('../', import.meta.url);
 try {
@@ -13,7 +13,7 @@ try {
   if (!archive) throw new Error('Package archive missing');
   await writeFile(
     join(directory, 'package.json'),
-    JSON.stringify({ name: 'worker-runtime-consumer', private: true, type: 'module' }),
+    JSON.stringify({ name: 'tasklane-consumer', private: true, type: 'module' }),
   );
   await execute(
     npm,
@@ -23,8 +23,8 @@ try {
   await writeFile(
     join(directory, 'worker.mjs'),
     `
-import { serve, output } from '@mapseekai/worker-runtime/host';
-import { nodeHost } from '@mapseekai/worker-runtime/node';
+import { serve, output } from '@mapseekai/tasklane/host';
+import { nodeHost } from '@mapseekai/tasklane/node';
 serve(nodeHost(), { double(values) { const result = Float64Array.from(values, (n) => n * 2); return output(result, [result.buffer]); } });
 `,
   );
@@ -32,8 +32,8 @@ serve(nodeHost(), { double(values) { const result = Float64Array.from(values, (n
     join(directory, 'smoke.mjs'),
     `
 import assert from 'node:assert/strict';
-import { createWorkerRuntime, transferBuffers } from '@mapseekai/worker-runtime';
-import { nodeWorker } from '@mapseekai/worker-runtime/node';
+import { createWorkerRuntime, transferBuffers } from '@mapseekai/tasklane';
+import { nodeWorker } from '@mapseekai/tasklane/node';
 const rt = createWorkerRuntime({ pools: { cpu: { factory: nodeWorker(new URL('./worker.mjs', import.meta.url)), size: 1 } } });
 const values = new Float64Array([1, 2, 3]);
 try {

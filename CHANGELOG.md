@@ -2,7 +2,7 @@
 
 ## 0.1.0 — 2026-09-24
 
-Initial release of the bounded Worker runtime with:
+Initial release of tasklane with:
 
 - browser Web Worker and Node.js worker_threads adapters
 - scoped lifecycle and bounded scheduling

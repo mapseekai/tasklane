@@ -1,4 +1,4 @@
-# @mapseekai/worker-runtime
+# tasklane
 
 面向浏览器 Web Worker 与 Node.js `worker_threads` 的高性能任务运行时，适合 GIS、图形处理、数据转换、WASM 计算、栅格/矢量预处理、文件解析等 CPU 密集型与大规模二进制数据场景。
 
@@ -6,7 +6,7 @@
 
 ## 核心能力
 
-- **统一 Worker Runtime**：应用级 Runtime、嵌套 Scope、统一生命周期和资源释放。
+- **统一 Runtime**：应用级 Runtime、嵌套 Scope、统一生命周期和资源释放。
 - **有界 Worker Pool**：统一控制 Worker 数量、活跃任务数和等待队列长度。
 - **任务调度**：支持 `interactive / foreground / background` 优先级、等待老化和组间公平调度。
 - **延迟输入准备**：任务获得执行和内存额度后才调用 `prepare()`，适合大文件、大数组和分块计算。
@@ -76,8 +76,8 @@ Session 适合需要长期绑定同一 Worker 的运行时：
 当前仓库版本为 `0.1.0`，需要 Node.js 22+ 和 pnpm。
 
 ```sh
-git clone git@github.com:mapseekai/worker-runtime.git
-cd worker-runtime
+git clone git@github.com:mapseekai/tasklane.git
+cd tasklane
 pnpm install --frozen-lockfile
 pnpm build
 ```
@@ -122,8 +122,8 @@ import {
   browserWorker,
   createWorkerRuntime,
   transferBuffers,
-} from '@mapseekai/worker-runtime';
-import type { TaskType } from '@mapseekai/worker-runtime';
+} from '@mapseekai/tasklane';
+import type { TaskType } from '@mapseekai/tasklane';
 
 type Tasks = {
   convert: TaskType<Float64Array, Float32Array>;
@@ -189,8 +189,8 @@ import {
   browserHost,
   output,
   serve,
-} from '@mapseekai/worker-runtime/host';
-import type { TaskType } from '@mapseekai/worker-runtime';
+} from '@mapseekai/tasklane/host';
+import type { TaskType } from '@mapseekai/tasklane';
 
 type Tasks = {
   convert: TaskType<Float64Array, Float32Array>;
@@ -204,7 +204,7 @@ serve<Tasks>(browserHost(self), {
 });
 ```
 
-Node.js 使用 `@mapseekai/worker-runtime/node` 中的 `nodeWorker()` 和 `nodeHost()`，任务模型保持一致。
+Node.js 使用 `@mapseekai/tasklane/node` 中的 `nodeWorker()` 和 `nodeHost()`，任务模型保持一致。
 
 ## 资源管理模型
 

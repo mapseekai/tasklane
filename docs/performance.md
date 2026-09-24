@@ -15,7 +15,7 @@ Chrome: 153.0.8010.53
 
 ## 1. 测试目标
 
-性能测试用于评估 Worker Runtime 在以下场景中的表现：
+性能测试用于评估 tasklane 在以下场景中的表现：
 
 - 大规模二进制数据转换
 - Float64 → Float32 high/low 布局
@@ -136,7 +136,7 @@ flat XY / offsets / feature ranges
 | Runtime / transfer | 4 | 317.1 | 807.3 | 42.0 |
 | 裸 Worker / transfer | 2 | 225.4 | 1135.8 | 21.1 |
 
-该组数据体现了 Worker Runtime 在大型 CPU 密集转换中的主要价值：
+该组数据体现了 tasklane 在大型 CPU 密集转换中的主要价值：
 
 - Transferable 提高二进制数据传递效率
 - 双 Worker 提升整体吞吐量

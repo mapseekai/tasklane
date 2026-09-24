@@ -46,5 +46,5 @@ export async function startServer(port = 4196) {
 }
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   await startServer(Number(process.env.PORT || 4196));
-  console.log('Worker runtime: http://127.0.0.1:4196');
+  console.log('tasklane: http://127.0.0.1:4196');
 }

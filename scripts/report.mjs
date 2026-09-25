@@ -33,7 +33,7 @@ const summarize = (document, workload, inputMiB, mode, workers) => {
   };
 };
 
-console.log('Benchmark result snapshots updated:');
+console.log('Benchmark result snapshots updated (Markdown and verification.json are unchanged):');
 console.log('  docs/results/node.json');
 console.log('  docs/results/browser.json');
 console.log('  docs/results/stress.json');

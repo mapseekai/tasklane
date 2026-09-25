@@ -1,72 +1,182 @@
 import { integer, RuntimeError } from './errors.js';
 
-/** Count unique backing stores, not view lengths. This is NOT a JS-heap estimator.
- * Only inert, cloneable records/arrays/maps/sets are traversed; accessors are rejected.
- * The traversal is bounded so a control operation cannot walk millions of objects.
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const typedLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'length')!.get!;
+const dataBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
+const mapSize = Object.getOwnPropertyDescriptor(Map.prototype, 'size')!.get!;
+const setSize = Object.getOwnPropertyDescriptor(Set.prototype, 'size')!.get!;
+const arrayBufferBytes = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!;
+const sharedBufferBytes =
+  typeof SharedArrayBuffer === 'undefined'
+    ? undefined
+    : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')!.get!;
+const regexpSource = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source')!.get!;
+
+export interface TraversalLimits {
+  maxObjects?: number;
+  /** Inspect custom view fields for resident data; may enumerate typed-array indices. */
+  resident?: boolean;
+  maxEntries?: number;
+  maxPending?: number;
+  /** Separate from binary budgets; UTF-16 strings and scalar metadata are charged conservatively. */
+  maxMetadataBytes?: number;
+}
+
+/** Binary backing stores only. Metadata has independent work/size limits, not a JS heap guarantee.
+ * Inert values only: accessors and custom prototypes are rejected. Proxies are not supported.
  */
-export function binaryByteLength(value: unknown, maxObjects = 100_000): number {
-  integer(maxObjects, 'maxObjects', 1);
+export function binaryByteLength(value: unknown, limits: TraversalLimits = {}): number {
+  return measure(value, limits).binary;
+}
+
+/** Deterministic data accounting, including resident metadata. Not a JS heap estimator. */
+export function dataByteLength(value: unknown, limits: TraversalLimits = {}): number {
+  const bytes = measure(value, limits);
+  return bytes.binary + bytes.metadata;
+}
+function measure(value: unknown, limits: TraversalLimits): { binary: number; metadata: number } {
+  if (!limits || typeof limits !== 'object' || Array.isArray(limits)) {
+    throw new RuntimeError('INVALID_ARGUMENT', 'Traversal limits must be an options object');
+  }
+  const maxObjects = integer(limits.maxObjects ?? 100_000, 'maxObjects', 1);
+  const maxEntries = integer(limits.maxEntries ?? 1_000_000, 'maxEntries', 1);
+  const maxPending = integer(limits.maxPending ?? maxObjects, 'maxPending', 1);
+  const maxMetadataBytes = integer(limits.maxMetadataBytes ?? 64 * 1024 ** 2, 'maxMetadataBytes');
   const seen = new Set<object>();
+  const pending = new Set<object>();
   const buffers = new Set<object>();
-  const stack: unknown[] = [value];
-  let bytes = 0;
-  while (stack.length) {
-    const item = stack.pop();
-    if (item === null || typeof item !== 'object') continue;
-    if (seen.has(item)) continue;
-    seen.add(item);
-    if (seen.size > maxObjects) {
+  const stack: object[] = [];
+  let bytes = 0,
+    entries = 0,
+    metadata = 0;
+  const fail = () => {
+    throw new RuntimeError('BUDGET_EXCEEDED', 'Packet metadata traversal limit exceeded');
+  };
+  const charge = (count: number) => {
+    metadata += count;
+    if (metadata > maxMetadataBytes) fail();
+  };
+  const push = (item: unknown) => {
+    if (typeof item === 'function' || typeof item === 'symbol')
       throw new RuntimeError(
-        'BUDGET_EXCEEDED',
-        'Binary metadata traversal exceeded its object limit',
+        'INVALID_ARGUMENT',
+        'Packets require cloneable data; use setResource for opaque state',
       );
+    if (item === null || typeof item !== 'object') {
+      if (typeof item === 'string') charge(item.length * 2);
+      else if (typeof item === 'boolean') charge(1);
+      else if (typeof item === 'number') charge(8);
+      else if (typeof item === 'bigint') {
+        if (item < -(1n << 63n) || item >= 1n << 64n)
+          throw new RuntimeError('INVALID_ARGUMENT', 'Packet BigInt metadata must fit in 64 bits');
+        charge(8);
+      }
+      return;
     }
-    const buffer = ArrayBuffer.isView(item) ? item.buffer : item;
+    if (seen.has(item) || pending.has(item)) return;
+    // A fixed structural charge prevents collections of empty objects from being free.
+    if (
+      !ArrayBuffer.isView(item) &&
+      !(item instanceof ArrayBuffer) &&
+      !(typeof SharedArrayBuffer !== 'undefined' && item instanceof SharedArrayBuffer)
+    )
+      charge(16);
+    if (seen.size + pending.size >= maxObjects || pending.size >= maxPending) fail();
+    pending.add(item);
+    stack.push(item);
+  };
+  const edge = (item: unknown) => {
+    if (++entries > maxEntries) fail();
+    push(item);
+  };
+  push(value);
+  while (stack.length) {
+    const item = stack.pop()!;
+    pending.delete(item);
+    seen.add(item);
+    const buffer: unknown = ArrayBuffer.isView(item)
+      ? item instanceof DataView
+        ? dataBuffer.call(item)
+        : typedBuffer.call(item)
+      : item;
     if (
       buffer instanceof ArrayBuffer ||
       (typeof SharedArrayBuffer !== 'undefined' && buffer instanceof SharedArrayBuffer)
     ) {
       if (!buffers.has(buffer)) {
         buffers.add(buffer);
-        bytes += buffer.byteLength;
+        bytes +=
+          buffer instanceof ArrayBuffer
+            ? arrayBufferBytes.call(buffer)
+            : sharedBufferBytes!.call(buffer);
         integer(bytes, 'binaryByteLength');
       }
-      continue;
-    }
-    if (item instanceof Map) {
-      for (const [key, val] of item) stack.push(key, val);
+      // Typed-array indices are backing-store data, not metadata. Additional own enumerable
+      // fields on other built-ins are still visited (important for resident cache values).
+      if (ArrayBuffer.isView(item)) {
+        if (!limits.resident) continue;
+        if (!(item instanceof DataView)) {
+          const length = typedLength.call(item) as number;
+          if (length > maxEntries - entries) fail();
+          entries += length;
+        }
+        for (const key in item) {
+          if (!Object.hasOwn(item, key)) continue;
+          if (!(item instanceof DataView) && /^(0|[1-9][0-9]*)$/.test(key)) continue;
+          const descriptor = Object.getOwnPropertyDescriptor(item, key);
+          if (!descriptor || !('value' in descriptor))
+            throw new RuntimeError(
+              'INVALID_ARGUMENT',
+              'Accessor properties are not allowed in packets',
+            );
+          charge(key.length * 2);
+          edge(descriptor.value);
+        }
+        continue;
+      }
+    } else if (item instanceof Map) {
+      if (mapSize.call(item) > Math.floor((maxEntries - entries) / 2)) fail();
+      for (const [key, val] of Map.prototype.entries.call(item)) {
+        edge(key);
+        edge(val);
+      }
     } else if (item instanceof Set) {
-      for (const val of item) stack.push(val);
+      if (setSize.call(item) > maxEntries - entries) fail();
+      for (const val of Set.prototype.values.call(item)) edge(val);
     } else {
-      // Dates/regexps are cloneable scalar metadata. Reject custom class instances
-      // rather than silently ignoring binary fields hidden behind their prototype.
       const proto: unknown = Object.getPrototypeOf(item);
-      if (item instanceof Date || item instanceof RegExp) continue;
-      if (proto !== Object.prototype && proto !== null && !Array.isArray(item)) {
+      if (
+        !(item instanceof Date) &&
+        !(item instanceof RegExp) &&
+        proto !== Object.prototype &&
+        proto !== null &&
+        !Array.isArray(item)
+      ) {
         throw new RuntimeError(
           'INVALID_ARGUMENT',
           'Packets require plain records, collections and typed buffers',
         );
       }
-      for (const key of Object.keys(item)) {
-        const descriptor = Object.getOwnPropertyDescriptor(item, key);
-        if (!descriptor || !('value' in descriptor)) {
-          throw new RuntimeError(
-            'INVALID_ARGUMENT',
-            'Accessor properties are not allowed in packets',
-          );
-        }
-        stack.push(descriptor.value);
-      }
+      if (item instanceof RegExp) charge(regexpSource.call(item).length * 2);
+      if (Array.isArray(item) && item.length > maxEntries - entries) fail();
     }
-    if (stack.length > maxObjects) {
-      throw new RuntimeError(
-        'BUDGET_EXCEEDED',
-        'Binary metadata traversal exceeded its pending limit',
-      );
+    // Incremental consumption avoids our own full key array and full layer work stack.
+    // JS engines may still allocate internally during enumeration; this is not an allocation sandbox.
+    for (const key in item) {
+      if (!Object.hasOwn(item, key)) continue;
+      if (entries >= maxEntries) fail();
+      const descriptor = Object.getOwnPropertyDescriptor(item, key);
+      if (!descriptor || !('value' in descriptor))
+        throw new RuntimeError(
+          'INVALID_ARGUMENT',
+          'Accessor properties are not allowed in packets',
+        );
+      charge(key.length * 2);
+      edge(descriptor.value);
     }
   }
-  return bytes;
+  return { binary: bytes, metadata };
 }
 
 /** Build an explicit, deduplicated list of owned buffers. Views must cover their

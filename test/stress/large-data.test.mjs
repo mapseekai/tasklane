@@ -29,14 +29,14 @@ test('1 GiB logical stream: full checksum parity with bounded 16 MiB packets', {
   assert.deepEqual(worker.hashes, main.hashes);
   assert.equal(worker.count, 67108864);
   assert.equal(worker.inputBytes, 1024 * MiB);
-  assert.ok(worker.runtimeStats.peakReserved.inputBytes <= 32 * MiB);
-  assert.ok(worker.runtimeStats.peakReserved.outputBytes <= 32 * MiB + 64);
+  assert.ok(worker.runtimeStats.peakReserved.inputBytes <= 32 * MiB + 8192);
+  assert.ok(worker.runtimeStats.peakReserved.outputBytes <= 32 * MiB + 16384);
   rows.push(main, worker);
 });
 test('single 256 MiB owned ArrayBuffer conversion, no truncation', { timeout: 60000 }, async () => {
   const rt = createWorkerRuntime({
     pools: { cpu: { factory, size: 1 } },
-    budgets: { inputBytes: 256 * MiB, outputBytes: 256 * MiB + 32 },
+    budgets: { inputBytes: 256 * MiB + 1024, outputBytes: 256 * MiB + 1024 },
     executionTimeoutMs: 60000,
   });
   try {
@@ -46,7 +46,7 @@ test('single 256 MiB owned ArrayBuffer conversion, no truncation', { timeout: 60
     const scope = rt.createScope();
     const lease = await scope.enqueue('convert', {
       pool: 'cpu',
-      budget: { inputBytes: 256 * MiB, scratchBytes: 0, outputBytes: 256 * MiB + 32 },
+      budget: { inputBytes: 256 * MiB + 1024, scratchBytes: 0, outputBytes: 256 * MiB + 1024 },
       prepare: () => ({ payload: { xy, operation: 'layout' }, transfer: transferBuffers(xy) }),
     }).result;
     assert.equal(xy.byteLength, 0);
@@ -138,7 +138,7 @@ test('single ~55 MiB UTF-8 GeoJSON: 100000 features and all 1.6 million vertices
     const scope = rt.createScope();
     const lease = await scope.enqueue('flatten', {
       pool: 'cpu',
-      budget: { inputBytes, scratchBytes: 512 * MiB, outputBytes: 64 * MiB },
+      budget: { inputBytes: inputBytes + 1024, scratchBytes: 512 * MiB, outputBytes: 64 * MiB },
       prepare: () => ({ payload: { bytes }, transfer: transferBuffers(bytes) }),
     }).result;
     assert.equal(bytes.byteLength, 0);

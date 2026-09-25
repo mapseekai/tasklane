@@ -14,7 +14,11 @@ for (const operation of ['layout', 'project']) {
       rt.createScope().enqueue(
         'convert',
         options(null, {
-          budget: { inputBytes: xy.byteLength, scratchBytes: 0, outputBytes: xy.byteLength + 32 },
+          budget: {
+            inputBytes: xy.byteLength + 1024,
+            scratchBytes: 0,
+            outputBytes: xy.byteLength + 1024,
+          },
           prepare: () => ({ payload: { xy, operation }, transfer: transferBuffers(xy) }),
         }),
       ),

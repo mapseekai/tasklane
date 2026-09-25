@@ -8,7 +8,7 @@
 
 - **统一 Runtime**：应用级 Runtime、嵌套 Scope、统一生命周期和资源释放。
 - **有界 Worker Pool**：统一控制 Worker 数量、活跃任务数和等待队列长度。
-- **任务调度**：支持 `interactive / foreground / background` 优先级、等待老化和组间公平调度。
+- **任务调度**：支持 `interactive / foreground / background` 严格优先级、可选等待老化和组间公平调度。
 - **延迟输入准备**：任务获得执行和内存额度后才调用 `prepare()`，适合大文件、大数组和分块计算。
 - **Transferable 支持**：显式转移 `ArrayBuffer` 所有权，降低大二进制数据在线程间传递的复制成本。
 - **结果背压**：通过 `ResultLease` 保留结果额度，消费者释放后再允许后续任务继续占用对应资源。
@@ -24,6 +24,7 @@
 详细说明见：
 
 - [API 参考](docs/api.md)
+- [资源与调度契约](docs/resources.md)
 - [架构设计](docs/architecture.md)
 - [测试与验收](docs/testing.md)
 - [性能测试](docs/performance.md)
@@ -73,7 +74,13 @@ Session 适合需要长期绑定同一 Worker 的运行时：
 
 ## 安装与验证
 
-当前仓库版本为 `0.1.0`，需要 Node.js 22+ 和 pnpm。
+当前预发布版本为 `0.1.0-beta.1`，适合业务试点接入。仓库构建和 Node 示例需要 Node.js 22+ 与 pnpm，浏览器端使用 Web Worker。
+
+```sh
+npm install @mapseekai/tasklane@beta
+```
+
+源码构建与示例验证：
 
 ```sh
 git clone git@github.com:mapseekai/tasklane.git
@@ -99,6 +106,8 @@ pnpm verify
 pnpm benchmark
 node benchmarks/node.mjs --quick
 pnpm benchmark:browser
+pnpm benchmark:scheduler
+pnpm benchmark:cache
 ```
 
 浏览器示例：
@@ -121,6 +130,7 @@ http://127.0.0.1:4196
 import {
   browserWorker,
   createWorkerRuntime,
+  consumeResult,
   transferBuffers,
 } from '@mapseekai/tasklane';
 import type { TaskType } from '@mapseekai/tasklane';
@@ -149,37 +159,28 @@ const runtime = createWorkerRuntime<Tasks>({
   },
 });
 
-const scope = runtime.createScope('dataset');
-
-const handle = scope.enqueue('convert', {
-  pool: 'compute',
-  priority: 'interactive',
-  group: 'layer-roads',
-  affinity: 'dataset-a/shard-1',
-  budget: {
-    inputBytes: 8 * MiB,
-    scratchBytes: 0,
-    outputBytes: 4 * MiB,
-  },
-  prepare: ({ signal }) => {
-    signal.throwIfAborted();
-    const input = new Float64Array(MiB);
-    return {
-      payload: input,
-      transfer: transferBuffers(input),
-    };
-  },
-});
-
-const result = await handle.result;
 try {
-  consume(result.value);
+  await runtime.withScope('dataset', async (scope) => {
+    const handle = scope.enqueue('convert', {
+      pool: 'compute',
+      priority: 'interactive',
+      group: 'layer-roads',
+      affinity: 'dataset-a/shard-1',
+      // 根 TypedArray 没有对象包元数据，只计完整 backing store。
+      budget: { inputBytes: 8 * MiB, scratchBytes: 0, outputBytes: 4 * MiB },
+      prepare: ({ signal }) => {
+        signal.throwIfAborted();
+        const input = new Float64Array(MiB);
+        return { payload: input, transfer: transferBuffers(input) };
+      },
+    });
+    await consumeResult(handle, (value) => {
+      console.log('转换后的元素数', value.length);
+    });
+  });
 } finally {
-  result.release();
+  await runtime.dispose();
 }
-
-await scope.dispose();
-await runtime.dispose();
 ```
 
 Worker：
@@ -204,7 +205,14 @@ serve<Tasks>(browserHost(self), {
 });
 ```
 
-Node.js 使用 `@mapseekai/tasklane/node` 中的 `nodeWorker()` 和 `nodeHost()`，任务模型保持一致。
+Node.js 使用 `@mapseekai/tasklane/node` 中的 `nodeWorker()` 和 `nodeHost()`，任务模型保持一致。仓库提供可直接运行的 `examples/node.mjs` 和 `examples/node-worker.mjs`：
+
+```sh
+pnpm build
+node examples/node.mjs
+```
+
+示例演示复合数据包计账、显式转移，以及消费失败时仍释放结果、Scope 和 Runtime。
 
 ## 资源管理模型
 
@@ -224,7 +232,9 @@ cacheBytes
 - `outputBytes`：执行中及等待消费的结果
 - `cacheBytes`：Worker 长驻缓存
 
-配合 `maxWorkers`、`maxActiveTasks`、`maxQueuedTasks` 可以建立稳定的资源上限和背压机制。
+配合 `maxWorkers`、`maxActiveTasks`、`maxQueuedTasks` 和 `maxResultLeases`，可以限制任务并发、等待队列、结果租约数量和声明额度。输入输出的二进制 backing store 与传输元数据都会做大小校验；实际 JS 堆、结构化克隆副本和算法暂存需要应用另外约束。详见 [资源与调度契约](docs/resources.md)。
+
+默认 `maxActiveTasks = min(pool capacity, maxWorkers)`，准备输入也占一个 active 槽位。消费结果推荐 `consumeResult(handle, consume)`；仅需完成通知时设置 `discardResult: true`。Scope 可使用 `runtime.withScope()` 自动关闭。
 
 ## 推荐起点
 
@@ -241,6 +251,12 @@ Session：用于长期状态型运行时
 ```
 
 实际 Worker 数可结合算法复杂度、数据规模、内存带宽和主线程响应性通过基准测试调整。
+
+## 数据预算与执行边界
+
+任务预算包括字符串、普通数组和协议元数据，使用 `packetByteLength(value)` 计算传输计费量；复合 TypedArray 包还需预留少量元数据空间。结果在首次读取 `lease.value` 时解码。默认采用严格优先级，需要跨优先级老化时设置 `priorityPolicy: 'ageing'`。
+
+`prepare` 只接受同步输入构造，异步加载或昂贵准备在 Worker handler 内执行。`ctx.scratch` 提供受额度限制的临时 ArrayBuffer；普通 JS 分配和外部资源仍由算法管理。Runtime 运行可信 Worker，不是进程内存沙箱。完整语义见 [资源与调度契约](docs/resources.md)。
 
 ## License
 

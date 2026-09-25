@@ -51,7 +51,8 @@ export interface PreparedInput<T> {
 export interface TaskOptions<Input> {
   pool: string;
   budget: TaskBudget;
-  prepare(context: { signal: AbortSignal }): PreparedInput<Input> | Promise<PreparedInput<Input>>;
+  /** Synchronous input construction only. Run asynchronous or expensive preparation inside the Worker. */
+  prepare(context: { signal: AbortSignal }): PreparedInput<Input>;
   priority?: Priority;
   /** Fairness is per scope + group, not merely per task. */
   group?: string;
@@ -62,6 +63,8 @@ export interface TaskOptions<Input> {
   queueTimeoutMs?: number;
   /** Includes startup, prepare, and physical worker execution, but not queue waiting. */
   executionTimeoutMs?: number;
+  /** Discard successful values and return output credits before settled. result resolves a released lease. */
+  discardResult?: boolean;
   onProgress?: (value: unknown) => void;
 }
 
@@ -111,13 +114,21 @@ export interface RuntimeOptions {
   maxWorkers?: number;
   maxActiveTasks?: number;
   maxQueuedTasks?: number;
+  /** Bounds held leases plus admitted work, including zero-binary-byte results. */
+  maxResultLeases?: number;
+  /** Maximum simultaneously open scopes, including children. */
+  maxScopes?: number;
   budgets?: Partial<RuntimeBudgets>;
   startupTimeoutMs?: number;
   queueTimeoutMs?: number;
   executionTimeoutMs?: number;
-  /** Ageing eventually promotes waiting background tasks. */
+  /** Strict priorities by default; opt into cross-priority ageing explicitly. */
+  priorityPolicy?: 'strict' | 'ageing';
+  /** Promotion interval for the ageing policy. */
   ageingMs?: number;
   maxAffinityEntries?: number;
+  releaseTimeoutMs?: number;
+  budgetWaitMs?: number;
   /** Observer exceptions are isolated from task execution. */
   onDiagnostic?: (error: RuntimeError) => void;
 }
@@ -128,6 +139,8 @@ export interface RuntimeStats {
   workers: number;
   closingWorkers: number;
   leases: number;
+  scopes: number;
+  quarantinedWorkers: number;
   reserved: RuntimeBudgets;
   peakReserved: RuntimeBudgets;
   cacheUsedBytes: number;

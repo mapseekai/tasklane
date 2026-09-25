@@ -2,12 +2,12 @@
 
 ## 1. 当前验收结果
 
-2026-09-24 本机验收：
+2026-09-25 本机验收（协议 v3）：
 
 | 范围 | 通过 | 失败 | 跳过 |
 | --- | ---: | ---: | ---: |
-| 单元、故障注入、真实 Node Worker 集成 | 78 | 0 | 0 |
-| Chrome / Firefox / WebKit 浏览器 | 33 | 0 | 0 |
+| 单元、故障注入、真实 Node Worker 集成 | 114 | 0 | 0 |
+| Chrome / Firefox / WebKit 浏览器 | 39 | 0 | 0 |
 | 大数据与取消压力 | 4 | 0 | 0 |
 
 同时通过：
@@ -20,10 +20,10 @@
 - npm pack dry-run
 - 独立目录安装 tarball
 - tarball 中真实 Node Worker 冒烟
-- GitHub Actions Node.js 22 / 24
-- GitHub Actions 浏览器测试
 
-结构化摘要：[`results/verification.json`](results/verification.json)。
+GitHub Actions 配置覆盖 Node.js 22/24 与浏览器；上述是本机结果，本次未核验远端 CI 运行状态。
+
+结构化摘要位于仓库 `docs/results/verification.json`；原始结果不包含在 npm 包中。
 
 ## 2. 核心资源测试
 
@@ -67,7 +67,7 @@
 - Session
 - Session lost
 - 优先级
-- 等待老化
+- 默认严格优先级（可选老化由调度器回归测试覆盖）
 - 公平调度
 - 多 Pool 资源再分配
 - 大量并发请求关联
@@ -90,6 +90,17 @@
 - 配置快照
 
 该测试使用 `structuredClone` 语义的同域端点，适合稳定构造协议级故障。
+
+`test/regressions.test.mjs` 和 `test/packet.test.mjs` 另覆盖：
+
+- 8000 项调度选择、流式组公平性、有界历史和预算饥饿保护
+- 跨 Pool 回收数量、启动期取消、同步握手失败与提前响应
+- Packet 对象图身份、元数据计费、延迟解码与消费失败释放
+- 20 万元素数字数组与超宽输入提前拒绝
+- 普通缓存附加属性、实例资源、异步 disposer 和失败重试
+- Scope 释放 ACK、租约/Scope 数量上限与 terminate 重试
+- 永不结束的 Promise prepare 立即拒绝，不阻塞销毁
+- Node 错误监听窗口的确定性注入和 20 次真实 Worker 竞态
 
 ## 5. 大规模数值正确性
 
@@ -139,8 +150,10 @@ Firefox
 WebKit
 ```
 
-每个浏览器覆盖 11 项：
+每个浏览器运行 13 项测试，组合覆盖：
 
+- 元数据低报、20 万数字数组、scratch 超限与 Promise prepare 拒绝
+- progress 大小/ACK、完成后 context、丢弃结果和异步资源清理
 - 8 MiB Transferable
 - structured clone
 - ResultLease 背压
@@ -178,7 +191,7 @@ WebKit
 - 完整输出指纹
 - 慢消费者背压
 - 输入额度峰值
-- 输出额度峰值
+- 输出额度峰值（2 个通道预留 input <= 32 MiB + 8192 bytes，output <= 32 MiB + 16384 bytes，含协议元数据）
 - Worker 生命周期收敛
 
 ### 单个 256 MiB ArrayBuffer
@@ -237,7 +250,7 @@ leases = 0
 
 ## 8. 性能测试矩阵
 
-Node 与 Chrome 分别执行：
+完整基准命令为 Node 与 Chrome 分别安排：
 
 ```text
 4 workload / size groups
@@ -245,7 +258,7 @@ Node 与 Chrome 分别执行：
 × 3 repeats
 ```
 
-每个环境 84 次，合计 168 次。
+每个环境 84 次，合计 168 次。完整矩阵不属于 pnpm verify；修复后的功能回归通过不意味着重新跑过这 168 次计时。
 
 执行方式：
 
@@ -297,12 +310,15 @@ pnpm exec playwright install chrome firefox webkit
 ```sh
 pnpm benchmark
 pnpm benchmark:browser
+pnpm benchmark:scheduler
+pnpm benchmark:cache
 node scripts/report.mjs
 ```
 
 快速基准：
 
 ```sh
+pnpm build
 node benchmarks/node.mjs --quick
 node benchmarks/browser.mjs --quick
 ```
@@ -312,3 +328,13 @@ node benchmarks/browser.mjs --quick
 ```sh
 pnpm test:package
 ```
+
+独立示例：
+
+```sh
+pnpm build
+node examples/node.mjs
+pnpm dev
+```
+
+Node 示例校验转换结果和最终资源计数；浏览器示例的完成与取消路径由 Playwright 覆盖。`scripts/report.mjs` 只复制原始性能快照并打印摘要，不生成 testing.md、performance.md 或 verification.json；更新快照时应同步核对版本和运行日期。

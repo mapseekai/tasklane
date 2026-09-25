@@ -33,7 +33,7 @@ test('bounded traversal rejects oversized object graphs', () =>
   assert.throws(() =>
     binaryByteLength(
       Array.from({ length: 11 }, () => ({})),
-      10,
+      { maxObjects: 10 },
     ),
   ));
 test('transfer helper deduplicates explicitly owned buffers', () => {
@@ -63,7 +63,11 @@ test('budget reserve is atomic, idempotent and nonnegative', () => {
 });
 test('lease invalidates value and releases once', () => {
   let released = 0;
-  const result = new OwnedResult(new Uint8Array(10), 10, () => released++);
+  const result = new OwnedResult(
+    { kind: 'binary', value: new Uint8Array(10) },
+    10,
+    () => released++,
+  );
   assert.equal(result.value.length, 10);
   result.release();
   result.release();
@@ -84,11 +88,11 @@ test('cache LRU eviction preserves recently accessed entries', () => {
 test('cache entry count bounds zero-byte metadata', () => {
   const store = new CacheStore(0, 2);
   const c = store.scope('a');
-  c.set('a', 1, 0);
-  c.set('b', 2, 0);
-  c.set('c', 3, 0);
+  c.set('a', null, 0);
+  c.set('b', null, 0);
+  c.set('c', null, 0);
   assert.equal(c.get('a'), undefined);
-  assert.equal(c.get('c'), 3);
+  assert.equal(c.get('c'), null);
 });
 test('cache scope isolation and owner cleanup', () => {
   const store = new CacheStore(32);
@@ -123,4 +127,10 @@ test('class instances cannot hide unaccounted binary allocations', () => {
 });
 test('Date and RegExp remain supported scalar metadata', () => {
   assert.equal(binaryByteLength({ date: new Date(), pattern: /test/ }), 0);
+});
+
+test('traversal limits require structured options', () => {
+  for (const limits of [10, null, [], '10']) {
+    assert.throws(() => binaryByteLength({}, limits), { code: 'INVALID_ARGUMENT' });
+  }
 });

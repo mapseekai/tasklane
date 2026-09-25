@@ -95,8 +95,8 @@ export async function runCase(config, factory, rawFactory, sampleMemory) {
   const chunks = Math.ceil(totalUnits / chunkUnits);
   const isRuntime = mode.startsWith('runtime-');
   const lanes = mode === 'main' || mode === 'cooperative-main' ? 1 : workers;
-  const maxInput = isJson ? featureChunk * 1400 : chunkMiB * MiB;
-  const maxOutput = isJson ? featureChunk * 400 + 64 : maxInput + 32;
+  const maxInput = (isJson ? featureChunk * 1400 : chunkMiB * MiB) + 4096;
+  const maxOutput = isJson ? featureChunk * 400 + 4096 : maxInput + 4096;
   const maxScratch = isJson ? maxInput * 8 : mode === 'runtime-clone' ? maxInput : 0;
   const runtime = isRuntime
     ? createWorkerRuntime({
@@ -125,7 +125,7 @@ export async function runCase(config, factory, rawFactory, sampleMemory) {
         Array.from({ length: workers }, async () => {
           const lease = await scope.enqueue('ping', {
             pool: 'cpu',
-            budget: { inputBytes: 0, scratchBytes: 0, outputBytes: 0 },
+            budget: { inputBytes: 0, scratchBytes: 0, outputBytes: 4096 },
             prepare: () => ({ payload: null }),
           }).result;
           lease.release();

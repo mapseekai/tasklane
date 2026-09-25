@@ -95,8 +95,9 @@ consumer release
 - 输入额度充足
 - 暂存额度充足
 - 结果额度充足
+- 非丢弃任务有可用租约名额
 
-这使大文件处理可以保持稳定的在途数据量。
+prepare 只执行短小的同步输入构造，异步准备由 Worker handler 完成。队列中的闭包仍可能捕获用户数据，生产者也应采用有限提交窗口。预算约束申报和协议数据，不是 JS 堆上限。
 
 ## 4. 优先级与公平调度
 
@@ -119,11 +120,13 @@ background
 调度器同时使用：
 
 - 优先级
-- 等待时间老化
-- Scope / group 上次服务时间
+- 显式启用 ageing 时的等待提升
+- Scope / group 上次服务序号
 - 入队顺序
 
-适合一个应用内同时存在交互任务与大批量后台任务的情况。
+默认采用严格优先级；`priorityPolicy: 'ageing'` 才允许后台随等待时间提升到交互级别，两者均不抢占执行中的任务。
+
+每个优先级/组/Pool 或 Session 通道维护 FIFO 索引堆，准入不复制和排序完整等待队列。空闲组历史有界保留，新组使用当前服务时钟，连续补交任务不会重置公平性。预算不足的等待者达到 `budgetWaitMs` 后，会保护其短缺额度，阻止小任务无限插队。
 
 ## 5. Worker Slot
 
@@ -192,11 +195,11 @@ cacheBytes
 
 ### 输入预算
 
-输入预算在调用 `prepare()` 前预留，适合控制批量任务的数据包生成速度。
+输入预算在同步调用 `prepare()` 前预留，发送前检查 `packetByteLength`：包含二进制 backing store、字符串以及扁平对象图编码的元数据。复合 TypedArray 包需要同时申报 buffer 和元数据空间。
 
 ### 暂存预算
 
-`scratchBytes` 用于声明算法执行期间的预计临时空间，例如：
+`scratchBytes` 在准入时预留。`ctx.scratch.allocate(bytes)` 提供受限的临时 ArrayBuffer，release 或任务结束会 detach 全部别名。以下直接分配仍由应用估算，Runtime 不会自动监控：
 
 - JSON 解析对象
 - WASM heap
@@ -205,7 +208,7 @@ cacheBytes
 
 ### 结果预算
 
-结果预算在任务准入时预留，在 `ResultLease.release()` 时释放。
+结果预算在任务准入时预留，Host 编码、校验后才发送，Runtime 接收时只检查封装和字节数。首次访问 `lease.value` 才解码对象图；调用 `release()` 归还额度，`discardResult` 可不解码直接释放。
 
 这种设计让消费者速度参与上游调度，形成自然的结果背压。
 
@@ -227,6 +230,7 @@ cacheBytes
 interface ResultLease<T> {
   readonly value: T;
   readonly byteLength: number;
+  readonly released: boolean;
   release(): void;
 }
 ```
@@ -247,7 +251,7 @@ release()
 output budget available
 ```
 
-特别适合流水线式处理、异步上传、分块写入和渐进式数据消费。
+使用 `consumeResult(handle, consume)` 确保消费结束后释放，包括消费者抛错的路径。`settled` 只等待物理完成；仅需完成通知应显式 `discardResult: true`。`maxResultLeases` 和 `maxScopes` 分别限制未释放结果与 Scope 数量。
 
 ## 9. 取消模型
 
@@ -341,12 +345,12 @@ Host 提供：
 ctx.cache.get(key)
 ctx.cache.set(key, value, bytes)
 ctx.cache.setPinned(key, value, bytes)
-ctx.cache.delete(key)
+await ctx.cache.delete(key)
 ```
 
 普通缓存采用有界 LRU。
 
-Session 中的固定状态可通过 `setPinned()` 保存，例如数据库实例、数据集句柄或大型运行时对象。
+`setPinned()` 仅保存可检查的普通数据。数据库、WASM、数据集句柄等不透明实例使用 `setResource(key, value, bytes, disposer)`，声明资源费用并提供异步清理函数。`await cache.delete(key)` 在清理完成后归还额度；失败保留条目，允许重试。硬终止 Worker 无法保证外部资源 disposer 执行。
 
 缓存同时控制：
 
@@ -356,13 +360,14 @@ Session 中的固定状态可通过 `setPinned()` 保存，例如数据库实例
 
 ## 13. 协议
 
-协议使用固定版本和 Worker epoch：
+协议版本为 3，Runtime 与 Host 必须使用同一版本。消息还携带 Worker epoch：
 
 ```text
 hello
 ready
 request
 progress
+progress-ack
 result
 error
 cancelled
@@ -376,17 +381,23 @@ released
 请求消息包含：
 
 ```text
-protocolVersion
-workerEpoch
-requestId
-scopeId
-sessionId
-Task name
-payload
+tag
+version
+epoch
+id
+scope
+session (optional)
+task
+payload (Packet)
 maxOutputBytes
+maxScratchBytes
 ```
 
-这种协议适合独立打包的 Worker 脚本与主包协同运行。
+progress 仅承载 4 KiB 内的小型控制数据，最多单条在途，收到 progress-ack 后才能继续发送；阻塞期间只保存最新快照。任务结束后 context 关闭。
+
+Scope 销毁按 scope/epoch 等待 released 确认，超时或清理失败会拒绝；Session 正常关闭等待 disposer，失败保留 Worker 供重试。物理 terminate 失败保持隔离和额度，通过 `retryTermination()` 重试，不能把逻辑取消当成资源已释放。
+
+自定义 endpoint 必须遵守协议并运行可信代码；原生消息反序列化发生在接收校验之前，因此无法用协议构造进程内存沙箱。
 
 ## 14. 可观测性
 
@@ -407,6 +418,9 @@ Runtime 统计包括：
 queued
 active
 workers
+closingWorkers
+quarantinedWorkers
+scopes
 leases
 workerStarts
 workerTerminations

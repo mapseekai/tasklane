@@ -19,6 +19,9 @@ start.addEventListener('click', async () => {
   controller = new AbortController();
   const workers = Number(document.querySelector('#workers').value),
     totalMiB = Number(document.querySelector('#size').value);
+  // Fixed small metadata schema: xy, operation and result bounds/count.
+  // The allowance is specific to this demo, not a universal object-graph estimate.
+  const metadataBytes = 1024;
   const chunkBytes = 4 * MiB,
     chunks = totalMiB / 4;
   const runtime = createWorkerRuntime({
@@ -30,7 +33,10 @@ start.addEventListener('click', async () => {
       },
     },
     maxActiveTasks: workers,
-    budgets: { inputBytes: chunkBytes * workers, outputBytes: (chunkBytes + 32) * workers },
+    budgets: {
+      inputBytes: (chunkBytes + metadataBytes) * workers,
+      outputBytes: (chunkBytes + metadataBytes) * workers,
+    },
   });
   const scope = runtime.createScope('demo');
   let next = 0,
@@ -46,7 +52,11 @@ start.addEventListener('click', async () => {
             pool: 'cpu',
             cancellation: 'terminate',
             signal: controller.signal,
-            budget: { inputBytes: chunkBytes, scratchBytes: 0, outputBytes: chunkBytes + 32 },
+            budget: {
+              inputBytes: chunkBytes + metadataBytes,
+              scratchBytes: 0,
+              outputBytes: chunkBytes + metadataBytes,
+            },
             prepare: () => {
               const xy = coordinates(chunkBytes / 16, (chunk * chunkBytes) / 16);
               return { payload: { xy }, transfer: transferBuffers(xy) };

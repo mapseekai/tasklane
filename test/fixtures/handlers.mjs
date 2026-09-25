@@ -3,6 +3,28 @@ import { transferBuffers } from '../../dist/index.js';
 import { convert, flatten } from '../../benchmarks/workloads.mjs';
 
 export const handlers = {
+  oversizedOutput() {
+    return output('x'.repeat(2_000_000));
+  },
+  scratch(_value, ctx) {
+    ctx.scratch.allocate(9);
+    return output(null);
+  },
+  oversizedProgress(_value, ctx) {
+    ctx.progress(new Uint8Array(1024 ** 2));
+    return output(null);
+  },
+  lateProgress(_value, ctx) {
+    setTimeout(() => ctx.progress(new Uint8Array(1024 ** 2)), 30);
+    return output(null);
+  },
+  resource(_value, ctx) {
+    class Resource {}
+    ctx.cache.setResource('resource', new Resource(), 8, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    });
+    return output(null);
+  },
   ping: (value, ctx) =>
     output({ value, epoch: ctx.epoch, scope: ctx.scopeId, session: ctx.sessionId }),
   async wait({ ms = 20, cooperate = false }, ctx) {

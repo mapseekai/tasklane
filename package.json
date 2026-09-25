@@ -1,6 +1,6 @@
 {
   "name": "@mapseekai/tasklane",
-  "version": "0.1.0",
+  "version": "0.1.0-beta.1",
   "description": "A bounded task runtime for Web Workers and worker_threads",
   "type": "module",
   "license": "MIT",
@@ -32,7 +32,7 @@
     "src",
     "README.md",
     "LICENSE",
-    "docs"
+    "docs/*.md"
   ],
   "sideEffects": false,
   "scripts": {
@@ -49,7 +49,9 @@
     "verify": "pnpm typecheck && pnpm format:check && pnpm lint && pnpm test && pnpm test:browser && pnpm test:package",
     "prepack": "pnpm build",
     "dev": "pnpm build && node scripts/server.mjs",
-    "test:package": "node scripts/package-smoke.mjs"
+    "test:package": "node scripts/package-smoke.mjs",
+    "benchmark:scheduler": "pnpm build && node benchmarks/scheduler.mjs",
+    "benchmark:cache": "node benchmarks/cache.mjs"
   },
   "repository": {
     "type": "git",
@@ -60,5 +62,9 @@
     "@playwright/test": "1.63.0",
     "@types/node": "22.20.4",
     "typescript": "5.9.3"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta"
   }
 }

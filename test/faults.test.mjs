@@ -19,7 +19,6 @@ function fake(t, mutate = (endpoint) => endpoint, extra = {}) {
       return output(v);
     },
   });
-  t.after(stop);
   const rt = createWorkerRuntime({
     pools: {
       cpu: {
@@ -35,7 +34,13 @@ function fake(t, mutate = (endpoint) => endpoint, extra = {}) {
     startupTimeoutMs: 100,
     ...extra,
   });
-  t.after(() => rt.dispose().catch(() => {}));
+  t.after(async () => {
+    try {
+      await rt.dispose().catch(() => {});
+    } finally {
+      stop();
+    }
+  });
   return { rt, link, epoch: () => hello.epoch };
 }
 
@@ -92,7 +97,7 @@ test('malformed result byte accounting is rejected', async (t) => {
     type: 'result',
     id: task.id,
     scope: scope.id,
-    value: new Uint8Array(8),
+    value: { kind: 'binary', value: new Uint8Array(8) },
     byteLength: 0,
     workerMs: 1,
     cacheBytes: 0,
@@ -208,7 +213,7 @@ test('session dispose releases successful session result leases', async (t) => {
   const session = rt.createScope().session('cpu');
   const { pool, ...opts } = options(
     { size: 16 },
-    { budget: { inputBytes: 0, scratchBytes: 0, outputBytes: 16 } },
+    { budget: { inputBytes: 1024, scratchBytes: 0, outputBytes: 16 } },
   );
   const lease = await session.enqueue('allocate', opts).result;
   await session.dispose();
@@ -220,7 +225,9 @@ test('group scheduling metadata does not accumulate across completed groups', as
   const scope = rt.createScope();
   for (let i = 0; i < 100; i++)
     await take(scope.enqueue('ping', options(i, { group: `group-${i}` })));
-  assert.equal(rt.served.size, 0);
+  assert.ok(rt.scheduler.historySize <= 4096);
+  await scope.dispose();
+  assert.equal(rt.scheduler.historySize, 0);
 });
 test('runtime budget and options snapshot resists caller mutation', async (t) => {
   const { rt } = fake(t);

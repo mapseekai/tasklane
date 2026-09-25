@@ -1,5 +1,10 @@
 export { browserWorker } from './adapters/browser.js';
-export { binaryByteLength, transferBuffers } from './binary.js';
+export {
+  binaryByteLength,
+  dataByteLength,
+  transferBuffers,
+  type TraversalLimits,
+} from './binary.js';
 export { RuntimeError, type ErrorCode } from './errors.js';
 export {
   createWorkerRuntime,
@@ -29,3 +34,18 @@ export type {
   TaskType,
   WorkerEndpoint,
 } from './types.js';
+
+/** Consume a result with deterministic credit return, including when the consumer throws. */
+export async function consumeResult<T, R>(
+  handle: import('./types.js').TaskHandle<T>,
+  consume: (value: T) => R | Promise<R>,
+): Promise<R> {
+  const lease = await handle.result;
+  try {
+    return await consume(lease.value);
+  } finally {
+    lease.release();
+  }
+}
+
+export { packetByteLength } from './packet.js';

@@ -1,320 +1,92 @@
-# 大数据转换性能
+# 性能验证与基准
 
-验收日期：2026-09-24。
+当前 Runtime 使用协议 v3：输入输出包含元数据计费，结果首次读取 value 时解码，调度默认严格优先级。基准脚本已按这些规则预留额度。
 
-测试环境：
+仓库 `docs/results/node.json`、`browser.json` 和 `stress.json` 保存的是 2026-09-24 修复前的历史快照。本轮没有重跑完整的 168 次计时矩阵，因此历史吞吐量、资源峰值和 Runtime/裸 Worker 对比不代表当前实现。原始数据保持不变，便于复现和对照；当前功能验收见 [测试与验收](testing.md)。
 
-```text
-CPU: Apple M4
-Logical CPUs: 10
-Memory: 16 GiB
-Architecture: arm64
-Node.js: v22.23.1
-Chrome: 153.0.8010.53
+## 当前调度与缓存基准
+
+```sh
+pnpm benchmark:scheduler
+pnpm benchmark:cache
 ```
 
-## 1. 测试目标
+调度基准使用 1 个预热后的 Node Worker、8 个 interactive 组、一次性入队，每档运行 3 次。本次修复验证记录：
 
-性能测试用于评估 tasklane 在以下场景中的表现：
+| 任务数 | 批次总耗时中位数 | 三次运行最大定时器延迟 |
+| ---: | ---: | ---: |
+| 500 | 19.3 ms | 1.9 ms |
+| 1000 | 24.0 ms | 1.4 ms |
+| 2000 | 47.6 ms | 2.2 ms |
+| 8000 | 148.5 ms | 12.3 ms |
 
-- 大规模二进制数据转换
-- Float64 → Float32 high/low 布局
-- 经纬度 → Web Mercator
-- GeoJSON → 平坦二进制几何
-- structured clone 与 Transferable 对比
-- 1 / 2 / 4 Worker 扩展
-- Runtime 调度与裸 Worker 对比
-- 主线程响应性
-- 资源峰值
+批次墙钟时间不等于一次连续主线程阻塞，也不能直接除以其他脚本记录的 CPU 时间来计算加速比。功能回归还检查 8000 项可运行任务的选择次数，避免单纯依赖受机器负载影响的时间阈值。
 
-## 2. 测量方法
+缓存基准只测 key 构造：100 万次操作，预热后取 3 次中位数。此次 JSON tuple 为 69.0 ms，命名空间前缀为 7.9 ms；不包含缓存查找、数据检查和驱逐，不能作为端到端吞吐倍率。
 
-Node 与 Chrome 各执行：
+## 大数据基准矩阵
 
-```text
-28 configurations
-× 3 repeats
-= 84 measurements
+```sh
+pnpm benchmark
+pnpm benchmark:browser
 ```
 
-两种环境合计 168 次计时。
+Node 与 Chrome 分别运行 4 组负载、7 种执行方式、3 次重复，每个环境 84 次。Node 每个用例启动独立进程，Chrome 每个用例使用新 context；每组正式计时前完成 3 个完整块的预热。
 
-每组执行 3 个完整计算块预热，正式统计记录：
+负载包括：
 
-- 总耗时
-- 输入 MiB/s
-- 8ms 页面心跳最大延迟
-- 输入生成时间
-- 结果消费时间
-- prepare 时间
-- Worker 时间
-- 消息往返时间
-- Runtime 资源预留峰值
-- Node 进程 RSS 峰值
+- 64 MiB Float64 XY → Float32 high/low 布局
+- 64 MiB、256 MiB 经纬度 → Web Mercator → high/low 布局
+- 100,000 个 LineString、1,600,000 个顶点、约 55.5 MiB UTF-8 GeoJSON → 平坦几何数组
 
-表格采用三次运行中位数，同时保留最小值和最大值。
+执行方式包括同步主线程、协作式主线程、Runtime clone/单 Worker、Runtime transfer/1/2/4 Worker、裸 Worker transfer/2 Worker。
 
-## 3. 工作负载
+正式总时间包含确定性输入生成、传输、调度和全量输出 checksum 消费，排除启动、预热和磁盘 I/O。所有模式的完整输出指纹必须一致。读取 lease.value 产生的解码工作属于消费阶段，不包含在任务完成前记录的 timing.totalMs 中。
 
-### layout
+指标区分：
 
-```text
-Float64 XY
-    ↓
-Float32 high / low XY
+| 指标 | 语义 |
+| --- | --- |
+| 基准 inputBytes / outputBytes | 业务二进制数组字节，用于计算吞吐量 |
+| runtimeStats.inputBytes / outputBytes | 成功发送的输入与成功结果的协议计费量，含元数据 |
+| runtimeStats.peakReserved | 准入声明额度的峰值，不是 JS 堆或 RSS |
+| prepareMs | 同步 prepare 回调时间，不包含其后的 Packet 编码 |
+| roundTripMs | dispatch 到终态消息的往返时间，不含主线程结果解码 |
+| workerMs | Host 从执行开始到结果发送前的时间，含输入解码和输出编码 |
+| maxTimerLagMs | 8 ms 心跳的最大延迟，不是 FPS 或 INP |
+| Node RSS | 包含 Worker 的进程采样峰值，可能漏掉采样间瞬时峰值 |
+
+浏览器基准不测 RSS。GeoJSON 的 JSON.parse 和算法直接创建的对象不由 scratch arena 自动度量；其 scratchBytes 仍是算法声明。
+
+快速检查使用更小矩阵和 1 次计时，不代替完整性能统计：
+
+```sh
+pnpm build
+node benchmarks/node.mjs --quick
+node benchmarks/browser.mjs --quick
 ```
 
-适合图形、GIS 和高精度坐标上传前的数据布局准备。
+## 大数据正确性与背压
 
-### project
-
-```text
-longitude / latitude
-    ↓
-Web Mercator
-    ↓
-Float32 high / low XY
+```sh
+pnpm test:stress
 ```
 
-适合投影和渲染前坐标转换。
+4 项测试覆盖 1 GiB 累计分块流、单个 256 MiB buffer、约 55.5 MiB GeoJSON，以及 1000 请求取消风暴。1 GiB 流使用 2 个 Worker、每块 16 MiB 和模拟慢消费者；当前基准为元数据预留额外空间，断言 input 峰值不超过 32 MiB + 8192 bytes，output 不超过 32 MiB + 16384 bytes。
 
-### geojson
+这些测试验证数据正确性、声明额度和生命周期收敛，不证明相同数据量的整个 JS 对象图或进程内存受同样上限控制。
 
-```text
-GeoJSON FeatureCollection
-    ↓
-JSON parse
-    ↓
-flat XY / offsets / feature ranges
-```
+## 参数选择
 
-测试数据：
+仓库浏览器演示使用 4 MiB 分块，可选 1/2/4 Worker。应用应结合实际算法、设备与消费速度比较吞吐量、定时器延迟、queueMs、资源预留和进程内存；增加 Worker 数量不保证吞吐提升。
 
-```text
-100,000 LineString features
-1,600,000 vertices
-~55.5 MiB UTF-8
-```
+任务自有 ArrayBuffer 可使用 Transferable，业务仍持有的数据则需保留原值或在同步 prepare 中复制当前分块。普通复合包还需申报元数据。生产者应使用有限提交窗口，避免把大量业务对象捕获在排队闭包中。
 
-## 4. Chrome：64 MiB layout
+## 原始结果与更新流程
 
-| 执行方式 | Worker | 总耗时 ms | 输入 MiB/s | 心跳延迟 ms |
-| --- | ---: | ---: | ---: | ---: |
-| 同步主线程 | 0 | 108.8 | 588.2 | 101.0 |
-| 协作式主线程 | 0 | 124.6 | 513.6 | 20.3 |
-| Runtime / clone | 1 | 114.4 | 559.4 | 11.3 |
-| Runtime / transfer | 1 | 108.8 | 588.2 | 8.2 |
-| Runtime / transfer | 2 | 97.4 | 657.1 | 21.6 |
-| Runtime / transfer | 4 | 98.3 | 651.1 | 42.6 |
-| 裸 Worker / transfer | 2 | 97.9 | 653.7 | 22.0 |
+历史快照位于[源码仓库的 docs/results](https://github.com/mapseekai/tasklane/tree/main/docs/results)，npm 包不包含原始 JSON。本地仓库中也可直接读取这些文件；修复验证清单见 [review-resolution.md](review-resolution.md)。
 
-**适合配置：** 大块坐标布局可从 1–2 个 Worker 起步。双 Worker 在该机器上取得最高中位吞吐量。
-
-## 5. Chrome：64 MiB Web Mercator
-
-| 执行方式 | Worker | 总耗时 ms | 输入 MiB/s | 心跳延迟 ms |
-| --- | ---: | ---: | ---: | ---: |
-| 同步主线程 | 0 | 149.2 | 429.0 | 141.6 |
-| 协作式主线程 | 0 | 163.6 | 391.2 | 30.6 |
-| Runtime / clone | 1 | 153.4 | 417.2 | 13.2 |
-| Runtime / transfer | 1 | 150.0 | 426.7 | 10.4 |
-| Runtime / transfer | 2 | 105.2 | 608.4 | 20.6 |
-| Runtime / transfer | 4 | 103.6 | 617.8 | 42.9 |
-| 裸 Worker / transfer | 2 | 106.3 | 602.1 | 19.7 |
-
-**适合配置：** 投影计算具有较高 CPU 密度，2 个 Worker 可以兼顾吞吐量和页面响应性；更高并行度适合通过实际硬件基准决定。
-
-## 6. Chrome：256 MiB Web Mercator
-
-| 执行方式 | Worker | 总耗时 ms | 输入 MiB/s | 心跳延迟 ms |
-| --- | ---: | ---: | ---: | ---: |
-| 同步主线程 | 0 | 594.8 | 430.4 | 587.2 |
-| 协作式主线程 | 0 | 729.3 | 351.0 | 29.7 |
-| Runtime / clone | 1 | 453.6 | 564.4 | 14.4 |
-| Runtime / transfer | 1 | 413.0 | 619.9 | 11.2 |
-| **Runtime / transfer** | **2** | **225.4** | **1135.8** | **19.2** |
-| Runtime / transfer | 4 | 317.1 | 807.3 | 42.0 |
-| 裸 Worker / transfer | 2 | 225.4 | 1135.8 | 21.1 |
-
-该组数据体现了 tasklane 在大型 CPU 密集转换中的主要价值：
-
-- Transferable 提高二进制数据传递效率
-- 双 Worker 提升整体吞吐量
-- 主线程心跳保持更短延迟
-- Runtime 调度性能接近相同算法下的裸 Worker
-
-**推荐起点：2 Workers + 4–16 MiB 分块 + Transferable。**
-
-## 7. Chrome：GeoJSON 平坦化
-
-| 执行方式 | Worker | 总耗时 ms | 输入 MiB/s | 心跳延迟 ms |
-| --- | ---: | ---: | ---: | ---: |
-| 同步主线程 | 0 | 300.5 | 184.7 | 292.8 |
-| 协作式主线程 | 0 | 401.7 | 138.2 | 18.8 |
-| Runtime / clone | 1 | 308.1 | 180.2 | 5.7 |
-| Runtime / transfer | 1 | 292.3 | 189.9 | 5.1 |
-| **Runtime / transfer** | **2** | **170.7** | **325.2** | **12.2** |
-| Runtime / transfer | 4 | 169.6 | 327.3 | 26.2 |
-| 裸 Worker / transfer | 2 | 170.1 | 326.4 | 12.7 |
-
-**适合配置：** JSON 解析和几何平坦化可采用 2 个 Worker 作为常用起点。数据源天然可分块时，可以进一步基于机器核数和内存压力调节。
-
-## 8. Node.js：256 MiB Web Mercator
-
-| 执行方式 | Worker | 总耗时 ms | 输入 MiB/s | 心跳延迟 ms | RSS 峰值 MiB |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 同步主线程 | 0 | 989.7 | 258.7 | 989.4 | 217.2 |
-| 协作式主线程 | 0 | 1033.5 | 247.7 | 32.2 | 176.9 |
-| Runtime / clone | 1 | 915.1 | 279.8 | 20.0 | 257.9 |
-| Runtime / transfer | 1 | 807.9 | 316.9 | 17.9 | 194.8 |
-| Runtime / transfer | 2 | 747.0 | 342.7 | 40.8 | 278.8 |
-| Runtime / transfer | 4 | 751.2 | 340.8 | 90.4 | 360.2 |
-| 裸 Worker / transfer | 2 | 749.6 | 341.5 | 41.0 | 293.0 |
-
-Node.js 环境下，双 Worker 仍提供较高吞吐量。多 Worker 同时增加常驻内存，适合根据服务器资源预算配置。
-
-## 9. 1 GiB 有界分块流
-
-压力参数：
-
-```text
-1 GiB cumulative input
-67,108,864 points
-64 chunks
-16 MiB / chunk
-2 Workers
-2 ms simulated consumer delay
-```
-
-实测：
-
-| 指标 | 结果 |
-| --- | ---: |
-| 总耗时 | 2331.0 ms |
-| 输入吞吐量 | 439.3 MiB/s |
-| input 预留峰值 | 32 MiB |
-| output 预留峰值 | 32 MiB + 64 bytes |
-| 采样 RSS 峰值 | 243.5 MiB |
-
-这组测试体现了**累计处理量与同时在途数据量解耦**的能力。
-
-适合：
-
-- 超大文件分块转换
-- 流式解码
-- 栅格块处理
-- 矢量块构建
-- 分块导入/导出
-
-## 10. 单个 256 MiB Buffer
-
-```text
-256 MiB Float64 input
-16,777,216 points
-single transferable buffer
-```
-
-完成一次所有权转移和高低位布局转换，并对全部点执行数值校验。
-
-适合验证：
-
-- 大 ArrayBuffer 转移
-- 大型单任务
-- Worker 端连续数组计算
-- 大结果返回
-
-## 11. 单个约 55.5 MiB GeoJSON
-
-```text
-100,000 features
-1,600,000 vertices
-~55.5 MiB UTF-8
-```
-
-完成单次 JSON 解析、几何平坦化和全数组校验。
-
-适合验证：
-
-- 大文本解析
-- JSON 对象构建
-- 几何数组生成
-- 属性/几何格式插件的 Worker 化基础
-
-## 12. Worker 数量建议
-
-当前 Apple M4 测试结果可作为浏览器交互应用的起点：
-
-```text
-1 Worker
-适合：轻量计算、内存敏感应用、串行状态型任务
-
-2 Workers
-适合：大多数 CPU 密集型转换、GIS 几何处理、投影、格式解析
-
-4 Workers
-适合：高并行算法、后台批量处理、核数和内存资源充足的场景
-```
-
-对高交互应用，建议同时观察：
-
-```text
-throughput
-maxTimerLagMs
-peakReserved
-RSS / memory
-queueMs
-workerMs
-```
-
-Worker 数量可以通过运行时基准自动选择或作为应用配置项开放。
-
-## 13. clone 与 transfer
-
-性能测试同时提供两条数据通路：
-
-```text
-structured clone
-Transferable ownership
-```
-
-对于任务自有的大型 `ArrayBuffer`，Transferable 更适合作为高吞吐数据通路。
-
-对于仍由主线程业务模型持有的数据，可以在 `prepare()` 中构造独立任务包，再将该任务包通过 Transferable 交给 Worker。
-
-## 14. Runtime 与裸 Worker
-
-双 Worker 对照使用相同：
-
-- 转换算法
-- 数据块大小
-- Transferable
-- 结果校验
-
-Runtime 额外提供：
-
-- 有界准入
-- Scope
-- Session
-- 优先级
-- 公平调度
-- 资源预算
-- 结果背压
-- 取消语义
-- Worker epoch
-- 统计指标
-
-在主要测试组中，Runtime 的墙钟性能与裸 Worker 接近，适合将这些运行时能力作为统一基础设施使用。
-
-## 15. 原始数据
-
-完整原始结果：
-
-- [Node.js](results/node.json)
-- [Chrome](results/browser.json)
-- [Stress](results/stress.json)
-- [Verification](results/verification.json)
-
-重新运行基准并同步原始结果快照：
+重新生成完整性能快照：
 
 ```sh
 pnpm benchmark
@@ -322,3 +94,5 @@ pnpm benchmark:browser
 pnpm test:stress
 node scripts/report.mjs
 ```
+
+脚本复制 benchmark-results 下的 node/browser/stress JSON，并打印选定统计。它不更新本页或 verification.json。同步数据时应核对每个文件的运行时间、代码版本和重复次数，再更新文档中的结论；不要把不同版本的快照组合为一次当前验收。

@@ -1,4 +1,4 @@
-import { createWorkerRuntime, type WorkerEndpoint } from '../src/index.js';
+import { binaryByteLength, createWorkerRuntime, type WorkerEndpoint } from '../src/index.js';
 import { output, type TaskHandlers } from '../src/host.js';
 
 type Tasks = {
@@ -28,3 +28,14 @@ const handlers: TaskHandlers<Tasks> = {
   ping: (text) => output(text.length),
 };
 void handlers;
+
+binaryByteLength(new Uint8Array(8), { maxObjects: 10, maxEntries: 100 });
+// @ts-expect-error Traversal limits use the structured options API.
+binaryByteLength(new Uint8Array(8), 10);
+
+scope.enqueue('ping', {
+  pool: 'cpu',
+  budget: { inputBytes: 8, scratchBytes: 0, outputBytes: 8 },
+  // @ts-expect-error Main-thread preparation must be synchronous.
+  prepare: async () => ({ payload: 'text' }),
+});

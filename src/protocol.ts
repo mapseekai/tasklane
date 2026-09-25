@@ -1,6 +1,7 @@
+import type { Packet } from './packet.js';
 import type { ErrorCode } from './errors.js';
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 3;
 export const PROTOCOL_TAG = '@mapseekai/tasklane';
 
 export interface Header {
@@ -20,12 +21,14 @@ export type RequestMessage = Header & {
   scope: string;
   session?: string;
   task: string;
-  payload: unknown;
+  payload: Packet;
   maxOutputBytes: number;
+  maxScratchBytes: number;
 };
 export type ToWorker =
   | (Header & { type: 'hello'; cacheBytes: number; cacheEntries: number })
   | RequestMessage
+  | (Header & { type: 'progress-ack'; id: string; scope: string })
   | (Header & { type: 'cancel'; id: string; scope: string })
   | (Header & { type: 'release-scope'; scope: string });
 export type FromWorker =
@@ -35,7 +38,7 @@ export type FromWorker =
       type: 'result';
       id: string;
       scope: string;
-      value: unknown;
+      value: Packet;
       byteLength: number;
       workerMs: number;
       cacheBytes: number;
@@ -48,7 +51,7 @@ export type FromWorker =
       workerMs: number;
       cacheBytes: number;
     })
-  | (Header & { type: 'released'; scope: string; cacheBytes: number });
+  | (Header & { type: 'released'; scope: string; cacheBytes: number; error?: WireError });
 
 export function header(epoch: number): Header {
   return { tag: PROTOCOL_TAG, version: PROTOCOL_VERSION, epoch };

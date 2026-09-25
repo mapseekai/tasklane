@@ -1,4 +1,7 @@
-import { binaryByteLength } from './binary.js';
+import { validateProgress } from './progress.js';
+import { yieldTask } from './yield.js';
+import { decodePacket, encodePacket, packetBytes } from './packet.js';
+import { ScratchArena } from './resources/scratch.js';
 import { aborted, asError, integer, required, RuntimeError } from './errors.js';
 import {
   type FromWorker,
@@ -27,6 +30,8 @@ export interface HostContext {
   readonly sessionId?: string;
   readonly epoch: number;
   readonly cache: ScopedCache;
+  /** Task-owned, measured backing stores. Allocations outside this arena are not tracked. */
+  readonly scratch: ScratchArena;
   /** Throttled to at most one message per 16ms per physical task. */
   progress(value: unknown): void;
   /** A real task-queue yield. Promise.resolve() is NOT sufficient for cancellation messages. */
@@ -57,18 +62,71 @@ export function serve<T extends Catalog<T> = TaskMap>(
 ): () => void {
   let epoch = 0;
   let cache: CacheStore | undefined;
-  let active: { request: RequestMessage; controller: AbortController } | undefined;
+  let active:
+    | { request: RequestMessage; controller: AbortController; acknowledge(): void }
+    | undefined;
   let disposed = false;
   const releaseAfter = new Set<string>();
   const send = (message: FromWorker, transfer?: readonly Transferable[]) =>
     port.postMessage(message, transfer);
   const release = (scope: string) => {
-    cache?.release(scope);
-    send({ ...header(epoch), type: 'released', scope, cacheBytes: cache?.bytes ?? 0 });
+    void (async () => {
+      try {
+        await cache?.release(scope);
+        send({ ...header(epoch), type: 'released', scope, cacheBytes: cache?.bytes ?? 0 });
+      } catch (error) {
+        send({
+          ...header(epoch),
+          type: 'released',
+          scope,
+          cacheBytes: cache?.bytes ?? 0,
+          error: wireError(error),
+        });
+      }
+    })().catch(() => {
+      disposed = true;
+    });
   };
   const execute = async (request: RequestMessage) => {
     const controller = new AbortController();
-    active = { request, controller };
+    let scratch: ScratchArena | undefined;
+    let closed = false,
+      inFlight = false,
+      hasPending = false;
+    let pending: unknown;
+    let progressTimer: ReturnType<typeof setTimeout> | undefined;
+    const flush = () => {
+      if (closed || disposed || controller.signal.aborted || inFlight || !hasPending) return;
+      const wait = 16 - (performance.now() - lastProgress);
+      if (wait > 0) {
+        if (!progressTimer)
+          progressTimer = setTimeout(() => {
+            progressTimer = undefined;
+            try {
+              flush();
+            } catch (error) {
+              disposed = true;
+              controller.abort(error);
+              void cache?.release().catch(() => {});
+            }
+          }, wait);
+        return;
+      }
+      const value = pending;
+      pending = undefined;
+      hasPending = false;
+      inFlight = true;
+      lastProgress = performance.now();
+      send({ ...header(epoch), type: 'progress', id: request.id, scope: request.scope, value });
+    };
+    active = {
+      request,
+      controller,
+      acknowledge() {
+        inFlight = false;
+        flush();
+      },
+    };
     const started = performance.now();
     let lastProgress = -Infinity;
     try {
@@ -81,34 +139,41 @@ export function serve<T extends Catalog<T> = TaskMap>(
         throw new RuntimeError('PROTOCOL_ERROR', 'Malformed task request');
       }
       integer(request.maxOutputBytes, 'maxOutputBytes');
+      scratch = new ScratchArena(request.maxScratchBytes);
       const handler = Object.hasOwn(handlers, request.task)
         ? (handlers as Record<string, TaskHandler<unknown, unknown>>)[request.task]
         : undefined;
       if (!handler) throw new RuntimeError('UNKNOWN_TASK', `Unknown task: ${request.task}`);
       const context: HostContext = {
+        scratch,
         signal: controller.signal,
         scopeId: request.scope,
         sessionId: request.session,
         epoch,
         cache: required(cache, 'Host cache').scope(request.scope, request.session),
         progress(value) {
-          if (controller.signal.aborted || disposed || performance.now() - lastProgress < 16)
-            return;
-          lastProgress = performance.now();
-          send({ ...header(epoch), type: 'progress', id: request.id, scope: request.scope, value });
+          if (closed || controller.signal.aborted || disposed) return;
+          validateProgress(value);
+          // Snapshot while bounded: caller mutation cannot enlarge a pending message later.
+          pending = structuredClone(value);
+          hasPending = true;
+          flush();
         },
         async checkpoint() {
+          if (closed || disposed) throw new RuntimeError('CLOSED', 'Task context has completed');
           controller.signal.throwIfAborted();
-          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          await yieldTask();
+          if (closed || disposed) throw new RuntimeError('CLOSED', 'Task context has completed');
           controller.signal.throwIfAborted();
         },
       };
-      const result = await handler(request.payload, context);
+      const result = await handler(decodePacket(request.payload), context);
       controller.signal.throwIfAborted();
       if (!result || !Object.hasOwn(result, 'value')) {
         throw new RuntimeError('PROTOCOL_ERROR', 'Handler must return output(value, transfer)');
       }
-      const byteLength = binaryByteLength(result.value);
+      const value = encodePacket(result.value, request.maxOutputBytes);
+      const byteLength = packetBytes(value);
       if (byteLength > request.maxOutputBytes) {
         throw new RuntimeError('BUDGET_EXCEEDED', 'Result exceeds reserved outputBytes');
       }
@@ -119,7 +184,7 @@ export function serve<T extends Catalog<T> = TaskMap>(
             type: 'result',
             id: request.id,
             scope: request.scope,
-            value: result.value,
+            value,
             byteLength,
             workerMs: performance.now() - started,
             cacheBytes: required(cache, 'Host cache').bytes,
@@ -140,6 +205,11 @@ export function serve<T extends Catalog<T> = TaskMap>(
         });
       }
     } finally {
+      closed = true;
+      scratch?.close();
+      pending = undefined;
+      hasPending = false;
+      clearTimeout(progressTimer);
       active = undefined;
       if (releaseAfter.delete(request.scope) && !disposed) release(request.scope);
     }
@@ -160,6 +230,17 @@ export function serve<T extends Catalog<T> = TaskMap>(
       return;
     }
     if (!epoch || message.epoch !== epoch) return;
+    if (message.type === 'progress-ack') {
+      if (active?.request.id === message.id && active.request.scope === message.scope)
+        try {
+          active.acknowledge();
+        } catch (error) {
+          disposed = true;
+          active.controller.abort(error);
+          void cache?.release().catch(() => {});
+        }
+      return;
+    }
     if (message.type === 'cancel') {
       if (active?.request.id === message.id && active.request.scope === message.scope) {
         active.controller.abort(aborted());
@@ -191,13 +272,13 @@ export function serve<T extends Catalog<T> = TaskMap>(
     void execute(message).catch(() => {
       disposed = true;
       active?.controller.abort();
-      cache?.release();
+      void cache?.release().catch(() => {});
     });
   });
   return () => {
     disposed = true;
     unsubscribe();
     active?.controller.abort();
-    cache?.release();
+    void cache?.release().catch(() => {});
   };
 }

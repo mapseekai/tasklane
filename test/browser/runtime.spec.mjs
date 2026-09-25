@@ -4,6 +4,119 @@ test.beforeEach(async ({ page }) => {
   await page.goto('/test/browser/harness.html');
 });
 
+test('metadata budgets, numeric graph roundtrip, scratch and synchronous preparation', async ({
+  page,
+}) => {
+  const result = await page.evaluate(async () => {
+    const { createWorkerRuntime, browserWorker, consumeResult } = await import('/dist/index.js');
+    const rt = createWorkerRuntime({
+      pools: { cpu: { size: 1, factory: browserWorker('/test/fixtures/browser-worker.mjs') } },
+    });
+    const scope = rt.createScope();
+    const options = (value) => ({
+      pool: 'cpu',
+      budget: { inputBytes: 8, scratchBytes: 8, outputBytes: 8 },
+      prepare: () => ({ payload: value }),
+    });
+    const errors = [];
+    try {
+      for (const [name, opts] of [
+        ['ping', options('x'.repeat(2_000_000))],
+        ['oversizedOutput', options(null)],
+        ['scratch', options(null)],
+        ['ping', { ...options(null), prepare: () => new Promise(() => {}) }],
+      ])
+        errors.push(
+          await scope.enqueue(name, opts).result.then(
+            () => 'unexpected success',
+            (e) => e.code,
+          ),
+        );
+      const numbers = Array(200_000).fill(42);
+      const valid = await consumeResult(
+        scope.enqueue('ping', {
+          ...options(numbers),
+          budget: { inputBytes: 16 * 1024 ** 2, scratchBytes: 0, outputBytes: 16 * 1024 ** 2 },
+        }),
+        (value) => value.value.length === numbers.length && value.value.every((n) => n === 42),
+      );
+      return { errors, valid, active: rt.stats.active, leases: rt.stats.leases };
+    } finally {
+      await rt.disposeWithin(1000);
+    }
+  });
+  expect(result).toEqual({
+    errors: ['BUDGET_EXCEEDED', 'BUDGET_EXCEEDED', 'BUDGET_EXCEEDED', 'INVALID_ARGUMENT'],
+    valid: true,
+    active: 0,
+    leases: 0,
+  });
+});
+
+test('bounded progress, completed contexts, discarded results and async resource cleanup', async ({
+  page,
+}) => {
+  const result = await page.evaluate(async () => {
+    const { createWorkerRuntime, browserWorker, consumeResult } = await import('/dist/index.js');
+    let progressMessages = 0;
+    const factory = browserWorker('/test/fixtures/browser-worker.mjs');
+    const rt = createWorkerRuntime({
+      pools: {
+        cpu: {
+          size: 1,
+          cacheBytes: 8,
+          factory: () => {
+            const endpoint = factory();
+            return {
+              ...endpoint,
+              onMessage(listener) {
+                return endpoint.onMessage((message) => {
+                  if (message.type === 'progress') progressMessages++;
+                  listener(message);
+                });
+              },
+            };
+          },
+        },
+      },
+    });
+    const options = {
+      pool: 'cpu',
+      budget: { inputBytes: 4096, scratchBytes: 0, outputBytes: 4096 },
+      prepare: () => ({ payload: null }),
+    };
+    try {
+      const scope = rt.createScope();
+      const error = await scope.enqueue('oversizedProgress', options).result.then(
+        () => null,
+        (e) => e.code,
+      );
+      await consumeResult(scope.enqueue('lateProgress', options), () => {});
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      for (let i = 0; i < 10; i++)
+        await scope.enqueue('ping', { ...options, discardResult: true }).settled;
+      const leases = rt.stats.leases;
+      const session = scope.session('cpu');
+      await consumeResult(session.enqueue('resource', options), () => {});
+      let closed = false;
+      const end = session.dispose().then(() => (closed = true));
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const early = closed;
+      await end;
+      return { error, progressMessages, leases, early, workers: rt.stats.workers };
+    } finally {
+      await rt.dispose();
+    }
+  });
+  expect(result).toEqual({
+    error: 'BUDGET_EXCEEDED',
+    progressMessages: 0,
+    leases: 0,
+    early: false,
+    workers: 0,
+  });
+});
+
 for (const transfer of [true, false]) {
   test(`real worker binary ownership: transfer=${transfer}`, async ({ page }) => {
     const result = await page.evaluate(async (transfer) => {
@@ -19,7 +132,7 @@ for (const transfer of [true, false]) {
       const lease = await scope.enqueue('echo', {
         pool: 'cpu',
         budget: {
-          inputBytes: bytes.byteLength,
+          inputBytes: bytes.byteLength + 1024,
           scratchBytes: bytes.byteLength,
           outputBytes: bytes.byteLength,
         },
@@ -65,7 +178,7 @@ test('slow result consumer applies backpressure before prepare', async ({ page }
     let prepared = 0;
     const opts = () => ({
       pool: 'cpu',
-      budget: { inputBytes: 0, scratchBytes: 0, outputBytes: 64 },
+      budget: { inputBytes: 1024, scratchBytes: 0, outputBytes: 64 },
       prepare: () => {
         prepared++;
         return { payload: { size: 64 } };
@@ -105,7 +218,7 @@ test('scope isolation, ordered result correlation, errors and session state', as
       b = rt.createScope('map');
     const opts = (payload) => ({
       pool: 'cpu',
-      budget: { inputBytes: 0, scratchBytes: 0, outputBytes: 0 },
+      budget: { inputBytes: 4096, scratchBytes: 0, outputBytes: 4096 },
       prepare: () => ({ payload }),
     });
     const take = async (h) => {
@@ -168,7 +281,7 @@ for (const mode of ['cooperative', 'discard', 'terminate']) {
       const scope = rt.createScope();
       const task = scope.enqueue(mode === 'terminate' ? 'spin' : 'wait', {
         pool: 'cpu',
-        budget: { inputBytes: 0, scratchBytes: 0, outputBytes: 0 },
+        budget: { inputBytes: 4096, scratchBytes: 0, outputBytes: 4096 },
         cancellation: mode,
         prepare: () => ({
           payload: { ms: mode === 'terminate' ? 2000 : 150, cooperate: mode === 'cooperative' },
@@ -210,7 +323,11 @@ test('one million points: exact binary output agrees with main-thread reference'
     const scope = rt.createScope();
     const lease = await scope.enqueue('convert', {
       pool: 'cpu',
-      budget: { inputBytes: xy.byteLength, scratchBytes: 0, outputBytes: xy.byteLength + 32 },
+      budget: {
+        inputBytes: xy.byteLength + 1024,
+        scratchBytes: 0,
+        outputBytes: xy.byteLength + 1024,
+      },
       prepare: () => ({ payload: { xy }, transfer: transferBuffers(xy) }),
     }).result;
     const result = {
@@ -243,7 +360,7 @@ test('named Worker keeps the default module type', async ({ page }) => {
       const scope = rt.createScope();
       const lease = await scope.enqueue('ping', {
         pool: 'cpu',
-        budget: { inputBytes: 0, scratchBytes: 0, outputBytes: 0 },
+        budget: { inputBytes: 4096, scratchBytes: 0, outputBytes: 4096 },
         prepare: () => ({ payload: 12 }),
       }).result;
       const value = lease.value.value;

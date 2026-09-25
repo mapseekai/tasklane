@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, writeFile, rm, readFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -20,6 +20,16 @@ try {
     ['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', `./${archive}`],
     { cwd: directory, timeout: 60000 },
   );
+  const installed = join(directory, 'node_modules/@mapseekai/tasklane');
+  const manifest = JSON.parse(await readFile(join(installed, 'package.json'), 'utf8'));
+  if (manifest.publishConfig?.access !== 'public')
+    throw new Error('Public access must be explicit');
+  try {
+    await access(join(installed, 'docs/results'));
+    throw new Error('Raw benchmark results included in package');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
   await writeFile(
     join(directory, 'worker.mjs'),
     `
@@ -32,7 +42,9 @@ serve(nodeHost(), { double(values) { const result = Float64Array.from(values, (n
     join(directory, 'smoke.mjs'),
     `
 import assert from 'node:assert/strict';
-import { createWorkerRuntime, transferBuffers } from '@mapseekai/tasklane';
+import { createWorkerRuntime, transferBuffers, packetByteLength, dataByteLength } from '@mapseekai/tasklane';
+assert.equal(packetByteLength('abcd'), 8);
+assert.equal(dataByteLength('abcd'), 8);
 import { nodeWorker } from '@mapseekai/tasklane/node';
 const rt = createWorkerRuntime({ pools: { cpu: { factory: nodeWorker(new URL('./worker.mjs', import.meta.url)), size: 1 } } });
 const values = new Float64Array([1, 2, 3]);

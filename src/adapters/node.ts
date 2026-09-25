@@ -4,33 +4,41 @@ import type { MessagePortLike, WorkerEndpoint } from '../types.js';
 /** Separate entry point keeps node:worker_threads out of browser bundles. */
 export function nodeWorker(url: string | URL, options: WorkerOptions = {}): () => WorkerEndpoint {
   return () => {
-    const worker = new Worker(url, options);
-    let stopping = false;
-    return {
-      postMessage: (value, transfer = []) =>
-        worker.postMessage(value, [...transfer] as TransferListItem[]),
-      onMessage(listener) {
-        worker.on('message', listener);
-        return () => worker.off('message', listener);
-      },
-      onFailure(listener) {
-        const exit = (code: number) => {
-          if (!stopping) listener(new Error(`Worker exited unexpectedly (code ${code})`));
-        };
-        worker.on('error', listener);
-        worker.on('messageerror', listener);
-        worker.on('exit', exit);
-        return () => {
-          worker.off('error', listener);
-          worker.off('messageerror', listener);
-          worker.off('exit', exit);
-        };
-      },
-      async terminate() {
-        stopping = true;
-        await worker.terminate();
-      },
-    };
+    return nodeEndpoint(new Worker(url, options));
+  };
+}
+
+/** Wrap a dedicated Node Worker, retaining an error sink until physical exit. */
+export function nodeEndpoint(worker: Worker): WorkerEndpoint {
+  let stopping = false;
+  // Keep an error sink for the entire physical lifetime, including unsubscribe -> exit.
+  const protect = () => {};
+  worker.on('error', protect);
+  worker.once('exit', () => worker.off('error', protect));
+  return {
+    postMessage: (value, transfer = []) =>
+      worker.postMessage(value, [...transfer] as TransferListItem[]),
+    onMessage(listener) {
+      worker.on('message', listener);
+      return () => worker.off('message', listener);
+    },
+    onFailure(listener) {
+      const exit = (code: number) => {
+        if (!stopping) listener(new Error(`Worker exited unexpectedly (code ${code})`));
+      };
+      worker.on('error', listener);
+      worker.on('messageerror', listener);
+      worker.on('exit', exit);
+      return () => {
+        worker.off('error', listener);
+        worker.off('messageerror', listener);
+        worker.off('exit', exit);
+      };
+    },
+    async terminate() {
+      stopping = true;
+      await worker.terminate();
+    },
   };
 }
 

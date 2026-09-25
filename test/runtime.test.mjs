@@ -39,7 +39,7 @@ test('exact input ownership is transferred, not copied', async (t) => {
     rt.createScope().enqueue(
       'echo',
       options(null, {
-        budget: { inputBytes: 1024, scratchBytes: 0, outputBytes: 1024 },
+        budget: { inputBytes: 2048, scratchBytes: 0, outputBytes: 1024 },
         prepare: () => ({ payload: { bytes: a }, transfer: transferBuffers(a) }),
       }),
     ),
@@ -58,7 +58,7 @@ test('structured-clone path preserves caller data', async (t) => {
         'echo',
         options(
           { bytes: a, transfer: false },
-          { budget: { inputBytes: 1024, scratchBytes: 1024, outputBytes: 1024 } },
+          { budget: { inputBytes: 2048, scratchBytes: 1024, outputBytes: 1024 } },
         ),
       ),
   );
@@ -72,7 +72,7 @@ test('output credits block prepare until a result is consumed', async (t) => {
   let prepared = 0;
   const opts = () =>
     options(null, {
-      budget: { inputBytes: 0, scratchBytes: 0, outputBytes: 64 },
+      budget: { inputBytes: 1024, scratchBytes: 0, outputBytes: 64 },
       prepare: () => {
         prepared++;
         return { payload: { size: 64 } };
@@ -92,12 +92,12 @@ test('output credits block prepare until a result is consumed', async (t) => {
   assert.equal(rt.stats.reserved.outputBytes, 0);
 });
 test('input and scratch admission precede packet allocation', async (t) => {
-  const rt = owned(t, { budgets: { inputBytes: 8, scratchBytes: 8 }, maxActiveTasks: 2 });
+  const rt = owned(t, { budgets: { inputBytes: 1024, scratchBytes: 8 }, maxActiveTasks: 2 });
   const scope = rt.createScope();
   let prepared = 0;
   const opts = () =>
     options(null, {
-      budget: { inputBytes: 8, scratchBytes: 8, outputBytes: 0 },
+      budget: { inputBytes: 1024, scratchBytes: 8, outputBytes: 8 },
       prepare: () => {
         prepared++;
         return { payload: { ms: 60 } };
@@ -109,7 +109,7 @@ test('input and scratch admission precede packet allocation', async (t) => {
   assert.equal(prepared, 1);
   assert.equal(b.state, 'queued');
   await Promise.all([take(a), take(b)]);
-  assert.equal(rt.stats.peakReserved.inputBytes, 8);
+  assert.equal(rt.stats.peakReserved.inputBytes, 1024);
 });
 test('queued cancellation never calls prepare', async (t) => {
   const rt = owned(t, { maxActiveTasks: 1 });
@@ -196,27 +196,16 @@ test('hard cancellation terminates non-interruptible computation and respawns', 
   assert.equal((await take(s.enqueue('ping', options(1)))).value, 1);
   assert.equal(rt.stats.workerStarts, 2);
 });
-test('cancel during async prepare retains reservations until callback settles', async (t) => {
-  const rt = owned(t, { maxActiveTasks: 1 });
-  const s = rt.createScope();
-  let finish;
-  const a = s.enqueue(
+test('async prepare is rejected immediately and returns all credits', async (t) => {
+  const rt = owned(t);
+  const h = rt.createScope().enqueue(
     'ping',
     options(null, {
-      budget: { inputBytes: 8, scratchBytes: 8, outputBytes: 8 },
-      prepare: () =>
-        new Promise((resolve) => {
-          finish = resolve;
-        }),
+      prepare: () => new Promise(() => {}),
     }),
   );
-  await until(() => finish);
-  a.cancel();
-  await assert.rejects(a.result);
-  assert.equal(rt.stats.reserved.inputBytes, 8);
-  assert.equal(rt.stats.active, 1);
-  finish({ payload: 1 });
-  await a.settled;
+  await assert.rejects(h.result, { code: 'INVALID_ARGUMENT' });
+  await h.settled;
   assert.equal(rt.stats.active, 0);
   assert.equal(rt.stats.reserved.inputBytes, 0);
 });
@@ -287,7 +276,7 @@ test('oversized output rejected in host, credits are released', async (t) => {
     .createScope()
     .enqueue(
       'allocate',
-      options({ size: 64 }, { budget: { inputBytes: 0, scratchBytes: 64, outputBytes: 32 } }),
+      options({ size: 64 }, { budget: { inputBytes: 1024, scratchBytes: 64, outputBytes: 32 } }),
     );
   await assert.rejects(a.result, { code: 'BUDGET_EXCEEDED' });
   assert.equal(rt.stats.reserved.outputBytes, 0);
@@ -334,7 +323,7 @@ test('scope disposal releases leases, cancels children, preserves unrelated scop
     b = rt.createScope();
   const lease = await a.enqueue(
     'allocate',
-    options({ size: 16 }, { budget: { inputBytes: 0, scratchBytes: 0, outputBytes: 16 } }),
+    options({ size: 16 }, { budget: { inputBytes: 1024, scratchBytes: 0, outputBytes: 16 } }),
   ).result;
   const task = child.enqueue('wait', options({ ms: 40 }));
   await a.dispose();

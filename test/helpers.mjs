@@ -4,7 +4,7 @@ export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export function options(payload, extra = {}) {
   return {
     pool: 'cpu',
-    budget: { inputBytes: 0, scratchBytes: 0, outputBytes: 0 },
+    budget: { inputBytes: 4096, scratchBytes: 0, outputBytes: 4096 },
     prepare: () => ({ payload }),
     ...extra,
   };

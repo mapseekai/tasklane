@@ -1,3 +1,4 @@
+import { decodeError } from '../remote-error.js';
 import { validateProgress } from '../progress.js';
 import {
   encodePacket,
@@ -14,6 +15,9 @@ import type {
   Catalog,
   PoolOptions,
   PreparedInput,
+  PreparedTaskOptions,
+  SessionPreparedTaskOptions,
+  TaskBudget,
   ResultLease,
   RuntimeBudgets,
   RuntimeOptions,
@@ -32,12 +36,10 @@ import { Scheduler } from './scheduler.js';
 
 type Timer = ReturnType<typeof setTimeout>;
 interface Pool {
-  name: string;
   options: Required<PoolOptions>;
   slots: Set<Slot>;
 }
 interface Slot {
-  id: number;
   epoch: number;
   pool: Pool;
   endpoint: WorkerEndpoint;
@@ -83,11 +85,17 @@ interface Job {
   order: number;
   groupKey: string;
   laneKey: string;
-  phase: 'queue' | 'startup' | 'prepare' | 'execute' | 'done';
+  phase: 'queue' | 'produce' | 'prepared' | 'startup' | 'prepare' | 'execute' | 'done';
   name: string;
   scope: ScopeRecord;
   session?: SessionRecord;
   options: TaskOptions<unknown>;
+  cost: TaskBudget;
+  preparation?: { produce: PreparedTaskOptions<unknown>['prepareAsync']; timeoutMs: number };
+  preparedInput?: PreparedInput<unknown>;
+  reserved: boolean;
+  workerStartedAt?: number;
+  preparationTimer?: Timer;
   state: TaskState;
   result: Deferred<ResultLease<unknown>>;
   settled: Deferred<void>;
@@ -98,7 +106,6 @@ interface Job {
   postedAt?: number;
   slot?: Slot;
   cancelled: boolean;
-  done: boolean;
   releaseExecution?: () => void;
   releaseOutput?: () => void;
   queueTimer?: Timer;
@@ -127,6 +134,8 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
   private serial = 0;
   private clock = 0;
   private active = 0;
+  private resultReservations = 0;
+  private readonly preparationWindow = new Set<Job>();
   private leaseCount = 0;
   private closed = false;
   private scheduled = false;
@@ -163,7 +172,6 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       const size = integer(pool.size, `${name}.size`, 1);
       capacity += size;
       this.pools.set(name, {
-        name,
         options: {
           ...pool,
           size,
@@ -184,6 +192,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
         'maxActiveTasks',
         1,
       ),
+      maxPreparingTasks: integer(options.maxPreparingTasks ?? 2, 'maxPreparingTasks', 1),
       maxQueuedTasks: integer(options.maxQueuedTasks ?? 1024, 'maxQueuedTasks', 1),
       maxResultLeases: integer(options.maxResultLeases ?? 1024, 'maxResultLeases', 1),
       maxScopes: integer(options.maxScopes ?? 4096, 'maxScopes', 1),
@@ -211,9 +220,16 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
 
   get stats(): RuntimeStats {
     const slots = this.slots();
+    const preparationReserved: TaskBudget = { inputBytes: 0, scratchBytes: 0, outputBytes: 0 };
+    for (const job of this.preparationWindow)
+      for (const key of ['inputBytes', 'scratchBytes', 'outputBytes'] as const)
+        preparationReserved[key] += job.cost[key];
     return {
       queued: this.queue.size,
       active: this.active,
+      preparing: [...this.preparationWindow].filter((job) => job.phase === 'produce').length,
+      prepared: [...this.preparationWindow].filter((job) => job.phase === 'prepared').length,
+      preparationReserved,
       workers: slots.length,
       closingWorkers: slots.filter((slot) => slot.state === 'closing').length,
       leases: this.leaseCount,
@@ -300,6 +316,11 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     name: K,
     raw: TaskOptions<T[K]['input']>,
     session?: SessionRecord,
+    preparation?: {
+      produce: PreparedTaskOptions<unknown>['prepareAsync'];
+      scratchBytes: number;
+      timeoutMs?: number;
+    },
   ): TaskHandle<T[K]['output']> {
     if (this.closed || scope.closed || session?.closed)
       throw new RuntimeError('CLOSED', 'Scope or session is closed');
@@ -322,7 +343,11 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       throw new RuntimeError('HARD_CANCEL_DENIED', 'This pool does not allow hard cancellation');
     }
     const budget = validateTaskBudget(raw.budget);
-    this.ledger.validate(budget);
+    const cost = {
+      ...budget,
+      scratchBytes: Math.max(budget.scratchBytes, preparation?.scratchBytes ?? 0),
+    };
+    this.ledger.validate(cost);
     if (
       raw.blobLimits !== undefined &&
       (!raw.blobLimits || typeof raw.blobLimits !== 'object' || Array.isArray(raw.blobLimits))
@@ -356,6 +381,14 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       laneKey: `${raw.pool}\0${session?.id ?? ''}`,
       phase: 'queue',
       name,
+      cost,
+      reserved: false,
+      preparation: preparation
+        ? {
+            produce: preparation.produce,
+            timeoutMs: timeout(preparation.timeoutMs ?? executionTimeoutMs, 'preparationTimeoutMs'),
+          }
+        : undefined,
       scope,
       session,
       options: {
@@ -373,7 +406,6 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       timing: { queueMs: 0, startupMs: 0, prepareMs: 0, roundTripMs: 0, workerMs: 0, totalMs: 0 },
       enqueuedAt: performance.now(),
       cancelled: false,
-      done: false,
     };
     this.jobs.set(job.id, job);
     scope.jobs.add(job);
@@ -386,7 +418,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       job.removeSignal = () => signal.removeEventListener('abort', cancel);
       if (signal.aborted) cancel();
     }
-    if (!job.done) {
+    if (job.phase !== 'done') {
       job.queueTimer = setTimeout(() => {
         this.failQueued(
           job,
@@ -407,6 +439,35 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       settled: job.settled.promise,
       cancel: (reason) => this.cancel(job, reason),
     };
+  }
+
+  /** @internal */
+  _enqueuePrepared<K extends TaskName<T>>(
+    scope: ScopeRecord,
+    name: K,
+    options: PreparedTaskOptions<T[K]['input']>,
+    session?: SessionRecord,
+  ): TaskHandle<T[K]['output']> {
+    const { prepareAsync, preparationScratchBytes, preparationTimeoutMs, ...rest } = options;
+    if (typeof prepareAsync !== 'function')
+      throw new RuntimeError('INVALID_ARGUMENT', 'prepareAsync callback is required');
+    integer(preparationScratchBytes, 'preparationScratchBytes');
+    return this._enqueue(
+      scope,
+      name,
+      {
+        ...rest,
+        prepare: () => {
+          throw new RuntimeError('PROTOCOL_ERROR', 'Missing prepared input');
+        },
+      },
+      session,
+      {
+        produce: prepareAsync,
+        scratchBytes: preparationScratchBytes,
+        timeoutMs: preparationTimeoutMs,
+      },
+    );
   }
 
   /** @internal */
@@ -488,51 +549,70 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     if (this.closed || this.draining) return;
     this.draining = true;
     try {
-      while (this.active < this.options.maxActiveTasks && this.queue.size) {
+      while (this.queue.size) {
         const now = performance.now();
         let chosen: Slot | undefined;
-        const job = this.scheduler.select(now, (candidate) => {
-          if (candidate.done) return false;
-          if (
-            !candidate.options.discardResult &&
-            this.active + this.leaseCount >= this.options.maxResultLeases
-          )
-            return false;
-          if (this.reservation?.done) this.reservation = undefined;
-          const reserved = this.reservation;
-          if (reserved && reserved !== candidate) {
-            const used = this.ledger.used,
-              limits = this.ledger.limits;
-            const keys = ['inputBytes', 'scratchBytes', 'outputBytes'] as const;
+        const job = this.scheduler.select(
+          now,
+          (candidate) => {
+            if (candidate.phase !== 'queue' && candidate.phase !== 'prepared') return false;
+            const producing = !!candidate.preparation && !candidate.reserved;
             if (
-              keys.some(
-                (key) =>
-                  reserved.options.budget[key] > limits[key] - used[key] &&
-                  candidate.options.budget[key] > 0,
-              )
+              producing
+                ? this.preparationWindow.size >= this.options.maxPreparingTasks
+                : this.active >= this.options.maxActiveTasks
             )
               return false;
-          }
-          if (!this.ledger.fits(candidate.options.budget)) {
+            if (candidate.reserved) {
+              try {
+                chosen = this.findSlot(candidate);
+              } catch (error) {
+                this.finish(candidate, undefined, asError(error));
+              }
+              return chosen !== undefined;
+            }
             if (
-              !reserved &&
-              now - candidate.enqueuedAt >= this.options.budgetWaitMs &&
-              this.canRun(candidate)
+              !candidate.options.discardResult &&
+              this.resultReservations + this.leaseCount >= this.options.maxResultLeases
             )
-              this.reservation = candidate;
-            return false;
-          }
-          try {
-            chosen = this.findSlot(candidate);
-          } catch (error) {
-            this.failQueued(candidate, asError(error));
-            return false;
-          }
-          return chosen !== undefined;
-        });
-        if (!job || !chosen) break;
+              return false;
+            if (this.reservation?.phase === 'done') this.reservation = undefined;
+            const reserved = this.reservation;
+            if (reserved && reserved !== candidate) {
+              const used = this.ledger.used,
+                limits = this.ledger.limits;
+              const keys = ['inputBytes', 'scratchBytes', 'outputBytes'] as const;
+              if (
+                keys.some(
+                  (key) => reserved.cost[key] > limits[key] - used[key] && candidate.cost[key] > 0,
+                )
+              )
+                return false;
+            }
+            if (!this.ledger.fits(candidate.cost)) {
+              if (
+                !reserved &&
+                now - candidate.enqueuedAt >= this.options.budgetWaitMs &&
+                (producing || this.canRun(candidate))
+              )
+                this.reservation = candidate;
+              return false;
+            }
+            if (producing) return true;
+            try {
+              chosen = this.findSlot(candidate);
+            } catch (error) {
+              this.failQueued(candidate, asError(error));
+              return false;
+            }
+            return chosen !== undefined;
+          },
+          (candidate) => !candidate.reserved,
+        );
+        if (!job) break;
         if (this.reservation === job) this.reservation = undefined;
-        this.admit(job, chosen);
+        if (job.preparation && !job.reserved) this.startPreparation(job);
+        else if (chosen) this.admit(job, chosen);
       }
     } finally {
       this.draining = false;
@@ -611,7 +691,6 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     }
     const id = ++this.serial;
     const slot: Slot = {
-      id,
       epoch: id,
       pool,
       endpoint,
@@ -657,6 +736,52 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       throw new RuntimeError('WORKER_FAILED', 'Worker failed synchronously during startup');
     return slot;
   }
+  private reserveJob(job: Job): void {
+    if (job.reserved) return;
+    job.releaseExecution = this.ledger.reserve({
+      inputBytes: job.cost.inputBytes,
+      scratchBytes: job.cost.scratchBytes,
+    });
+    job.releaseOutput = this.ledger.reserve({ outputBytes: job.cost.outputBytes });
+    job.reserved = true;
+    if (!job.options.discardResult) this.resultReservations++;
+    clearTimeout(job.queueTimer);
+    job.admittedAt = performance.now();
+    job.timing.queueMs = job.admittedAt - job.enqueuedAt;
+    job.executionTimer = setTimeout(() => this.deadline(job), job.options.executionTimeoutMs);
+  }
+  private startPreparation(job: Job): void {
+    this.reserveJob(job);
+    this.preparationWindow.add(job);
+    job.phase = 'produce';
+    job.state = 'preparing';
+    job.preparationTimer = setTimeout(() => this.deadline(job), job.preparation!.timeoutMs);
+    const started = performance.now();
+    void (async () => {
+      try {
+        const input = await job.preparation!.produce({ signal: job.controller.signal });
+        job.controller.signal.throwIfAborted();
+        if (
+          performance.now() - started >= job.preparation!.timeoutMs ||
+          performance.now() - job.admittedAt! >= job.options.executionTimeoutMs!
+        )
+          throw new RuntimeError('EXECUTION_TIMEOUT', 'Preparation exceeded deadline');
+        if (!input || !Object.hasOwn(input, 'payload'))
+          throw new RuntimeError('INVALID_ARGUMENT', 'prepareAsync must return a payload');
+        job.preparedInput = input;
+        job.phase = 'prepared';
+        job.state = 'prepared';
+      } catch (error) {
+        this.finish(job, undefined, asError(error));
+      } finally {
+        clearTimeout(job.preparationTimer);
+        job.timing.prepareMs = performance.now() - started;
+        job.preparation = undefined;
+        this.schedule();
+      }
+    })();
+  }
+
   private admit(job: Job, slot: Slot): void {
     if (slot.state !== 'ready' && slot.state !== 'starting') {
       this.failQueued(job, new RuntimeError('WORKER_FAILED', 'Worker is unavailable'));
@@ -666,12 +791,8 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     this.scheduler.remove(job);
     clearTimeout(job.queueTimer);
     clearTimeout(slot.idleTimer);
-    const budget = job.options.budget;
-    job.releaseExecution = this.ledger.reserve({
-      inputBytes: budget.inputBytes,
-      scratchBytes: budget.scratchBytes,
-    });
-    job.releaseOutput = this.ledger.reserve({ outputBytes: budget.outputBytes });
+    this.reserveJob(job);
+    this.preparationWindow.delete(job);
     job.slot = slot;
     job.scope.touched.add(slot);
     slot.job = job;
@@ -689,17 +810,16 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     }
 
     this.active++;
-    job.admittedAt = performance.now();
-    job.timing.queueMs = job.admittedAt - job.enqueuedAt;
+    job.workerStartedAt = performance.now();
     job.state = 'starting';
     job.phase = 'startup';
-    job.executionTimer = setTimeout(() => this.deadline(job), job.options.executionTimeoutMs);
     void this.run(job, slot);
   }
   private async run(job: Job, slot: Slot): Promise<void> {
     try {
       await slot.ready.promise;
-      job.timing.startupMs = performance.now() - required(job.admittedAt, 'Admission timestamp');
+      job.timing.startupMs =
+        performance.now() - required(job.workerStartedAt, 'Worker admission timestamp');
       job.controller.signal.throwIfAborted();
       if (!slot.tasks.has(job.name))
         throw new RuntimeError('UNKNOWN_TASK', `Worker does not implement ${job.name}`);
@@ -707,8 +827,9 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       job.phase = 'prepare';
       const started = performance.now();
       let prepared: PreparedInput<unknown>;
+      const asynchronouslyPrepared = job.preparedInput !== undefined;
       try {
-        const value = job.options.prepare({ signal: job.controller.signal });
+        const value = job.preparedInput ?? job.options.prepare({ signal: job.controller.signal });
         if (value && typeof (value as unknown as { then?: unknown }).then === 'function') {
           void Promise.resolve(value).catch(() => {});
           throw new RuntimeError(
@@ -719,13 +840,14 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
         if (!value || !Object.hasOwn(value, 'payload'))
           throw new RuntimeError('INVALID_ARGUMENT', 'prepare must return a payload');
         prepared = value;
+        job.preparedInput = undefined;
         if (
           performance.now() - required(job.admittedAt, 'Admission timestamp') >=
           required(job.options.executionTimeoutMs, 'Execution timeout')
         )
           throw new RuntimeError('EXECUTION_TIMEOUT', 'Preparation exceeded execution deadline');
       } finally {
-        job.timing.prepareMs = performance.now() - started;
+        if (!asynchronouslyPrepared) job.timing.prepareMs = performance.now() - started;
       }
       job.controller.signal.throwIfAborted();
       if (slot.state !== 'ready')
@@ -807,7 +929,12 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       clearTimeout(pending.timer);
       slot.releases.delete(message.scope);
       if (message.error) {
-        pending.deferred.reject(new RuntimeError('REMOTE_ERROR', message.error.message));
+        try {
+          pending.deferred.reject(decodeError(message.error));
+        } catch (error) {
+          pending.deferred.reject(error);
+          void this.retire(slot, asError(error));
+        }
         this.armIdle(slot);
         this.schedule();
         return;
@@ -824,7 +951,8 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       return;
     }
     const job = slot.job;
-    if (!job || job.done || message.id !== job.id || message.scope !== job.scope.id) return;
+    if (!job || job.phase === 'done' || message.id !== job.id || message.scope !== job.scope.id)
+      return;
     if (job.phase !== 'execute' || job.postedAt === undefined) {
       void this.retire(slot, new RuntimeError('PROTOCOL_ERROR', 'Response before dispatch'));
       return;
@@ -892,22 +1020,21 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
         void this.retire(slot, asError(error));
       }
     } else {
-      const error = message.error;
-      if (!error || typeof error.message !== 'string' || typeof error.code !== 'string') {
-        void this.retire(slot, new RuntimeError('PROTOCOL_ERROR', 'Malformed remote error'));
-        return;
+      try {
+        this.finish(job, undefined, decodeError(message.error));
+      } catch (error) {
+        void this.retire(slot, asError(error));
       }
-      this.finish(job, undefined, new RuntimeError(error.code, error.message));
     }
   }
   private cancel(job: Job, reason?: unknown): void {
-    if (job.done || job.cancelled) return;
+    if (job.phase === 'done' || job.cancelled) return;
     job.cancelled = true;
     job.controller.abort(aborted(reason));
     job.result.reject(aborted(reason));
     job.removeSignal?.();
     job.removeSignal = undefined;
-    if (job.state === 'queued') {
+    if (job.state === 'queued' || job.phase === 'prepared') {
       this.finish(job, undefined, aborted(reason));
       return;
     }
@@ -931,7 +1058,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     // discard mode deliberately waits for the physical result, without sending cancel.
   }
   private deadline(job: Job): void {
-    if (job.done) return;
+    if (job.phase === 'done') return;
     const error = new RuntimeError(
       'EXECUTION_TIMEOUT',
       'Task exceeded its physical execution deadline',
@@ -941,18 +1068,20 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     if (job.postedAt !== undefined && job.slot) void this.retire(job.slot, error);
     // Synchronous prepare cannot be preempted; run checks elapsed time on return.
     else if (job.phase === 'startup' && job.slot) void this.retire(job.slot, error);
+    else if (job.phase === 'prepared') this.finish(job, undefined, error);
+    else if (job.phase === 'produce') job.state = 'cancelling';
   }
   private failQueued(job: Job, error: Error): void {
-    if (job.done || job.state !== 'queued') return;
+    if (job.phase === 'done' || job.state !== 'queued') return;
     this.finish(job, undefined, error);
   }
   private finish(job: Job, result?: { value: Packet; bytes: number }, error?: Error): void {
-    if (job.done) return;
-    job.done = true;
+    if (job.phase === 'done') return;
     job.phase = 'done';
     if (this.reservation === job) this.reservation = undefined;
     clearTimeout(job.queueTimer);
     clearTimeout(job.executionTimer);
+    clearTimeout(job.preparationTimer);
     job.removeSignal?.();
     job.removeSignal = undefined;
     this.queue.delete(job);
@@ -960,7 +1089,11 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     this.jobs.delete(job.id);
     job.scope.jobs.delete(job);
 
-    if (job.admittedAt !== undefined) this.active--;
+    if (job.slot !== undefined) this.active--;
+    this.preparationWindow.delete(job);
+    if (job.reserved && !job.options.discardResult) this.resultReservations--;
+    job.preparedInput = undefined;
+    job.preparation = undefined;
     job.releaseExecution?.();
     job.releaseExecution = undefined;
     const slot = job.slot;
@@ -1039,6 +1172,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     scopes: number;
     leases: number;
     preparing: string[];
+    prepared: string[];
     quarantinedWorkers: number;
     owners: { id: string; label: string; tasks: number; leases: number; sessions: number }[];
   } {
@@ -1046,7 +1180,10 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       scopes: this.scopes.size,
       leases: this.leaseCount,
       preparing: [...this.jobs.values()]
-        .filter((job) => job.phase === 'prepare')
+        .filter((job) => job.phase === 'prepare' || job.phase === 'produce')
+        .map((job) => job.id),
+      prepared: [...this.preparationWindow]
+        .filter((job) => job.phase === 'prepared')
         .map((job) => job.id),
       quarantinedWorkers: this.stats.quarantinedWorkers,
       owners: [...this.scopes].map((scope) => ({
@@ -1120,8 +1257,13 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
         { cause: reason },
       );
       for (const pending of slot.session.scope.jobs) {
-        if (pending.session === slot.session && pending.state === 'queued')
-          this.failQueued(pending, slot.session.lost);
+        if (pending.session !== slot.session) continue;
+        if (pending.phase === 'produce') {
+          pending.controller.abort(slot.session.lost);
+          pending.result.reject(slot.session.lost);
+          pending.state = 'cancelling';
+        } else if (pending.phase === 'prepared' || pending.state === 'queued')
+          this.finish(pending, undefined, slot.session.lost);
       }
     }
     const job = slot.job;
@@ -1205,6 +1347,12 @@ export class RuntimeScope<T extends Catalog<T> = TaskMap> {
   ): TaskHandle<T[K]['output']> {
     return this.runtime._enqueue(this.record, name, options);
   }
+  enqueuePrepared<K extends TaskName<T>>(
+    name: K,
+    options: PreparedTaskOptions<T[K]['input']>,
+  ): TaskHandle<T[K]['output']> {
+    return this.runtime._enqueuePrepared(this.record, name, options);
+  }
   dispose(): Promise<void> {
     return this.runtime._disposeScope(this.record);
   }
@@ -1237,6 +1385,17 @@ export class WorkerSession<T extends Catalog<T> = TaskMap> {
     options: SessionTaskOptions<T[K]['input']>,
   ): TaskHandle<T[K]['output']> {
     return this.runtime._enqueue(
+      this.record.scope,
+      name,
+      { ...options, pool: this.record.pool },
+      this.record,
+    );
+  }
+  enqueuePrepared<K extends TaskName<T>>(
+    name: K,
+    options: SessionPreparedTaskOptions<T[K]['input']>,
+  ): TaskHandle<T[K]['output']> {
+    return this.runtime._enqueuePrepared(
       this.record.scope,
       name,
       { ...options, pool: this.record.pool },

@@ -1,7 +1,7 @@
 import type { Packet } from './packet.js';
-import type { ErrorCode } from './errors.js';
+import type { ErrorCode, RemoteErrorInfo } from './errors.js';
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 export const PROTOCOL_TAG = '@mapseekai/tasklane';
 
 export interface Header {
@@ -9,12 +9,11 @@ export interface Header {
   version: typeof PROTOCOL_VERSION;
   epoch: number;
 }
-export interface WireError {
+export interface WireError extends Omit<RemoteErrorInfo, 'code'> {
   code: ErrorCode;
-  name: string;
-  message: string;
-  stack?: string;
+  remoteCode?: string;
 }
+
 export type RequestMessage = Header & {
   type: 'request';
   id: string;

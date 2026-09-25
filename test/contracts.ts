@@ -1,4 +1,10 @@
-import { binaryByteLength, createWorkerRuntime, type WorkerEndpoint } from '../src/index.js';
+import {
+  binaryByteLength,
+  createWorkerRuntime,
+  iterateResults,
+  type WorkerEndpoint,
+  type RemoteErrorInfo,
+} from '../src/index.js';
 import { output, type TaskHandlers } from '../src/host.js';
 
 type Tasks = {
@@ -15,6 +21,42 @@ const task = scope.enqueue('convert', {
 });
 const result: Promise<Float32Array> = task.result.then((lease) => lease.value);
 void result;
+const prepared = scope.enqueuePrepared('convert', {
+  pool: 'cpu',
+  budget: { inputBytes: 16, scratchBytes: 0, outputBytes: 8 },
+  preparationScratchBytes: 32,
+  prepareAsync: async ({ signal }) => {
+    signal.throwIfAborted();
+    return { payload: new Float64Array(2) };
+  },
+});
+const preparedResult: Promise<Float32Array> = prepared.result.then((lease) => lease.value);
+void preparedResult;
+scope.session('cpu').enqueuePrepared('ping', {
+  budget: { inputBytes: 8, scratchBytes: 0, outputBytes: 8 },
+  preparationScratchBytes: 0,
+  prepareAsync: async () => ({ payload: 'text' }),
+});
+const chunks = iterateResults({
+  next: (signal) =>
+    scope.enqueue('ping', {
+      pool: 'cpu',
+      budget: { inputBytes: 8, scratchBytes: 0, outputBytes: 8 },
+      signal,
+      prepare: () => ({ payload: 'text' }),
+    }),
+  isDone: (value) => value === 0,
+  close: () => scope.dispose(),
+});
+const iterator: AsyncIterableIterator<number> = chunks;
+void iterator;
+const info: RemoteErrorInfo = {
+  name: 'DataError',
+  message: 'failed',
+  code: 'DOMAIN_CODE',
+  details: { limit: 10 },
+};
+void info;
 // @ts-expect-error Unknown task names must not typecheck.
 scope.enqueue('unknown', {});
 scope.enqueue('convert', {

@@ -5,7 +5,7 @@ export {
   transferBuffers,
   type TraversalLimits,
 } from './binary.js';
-export { RuntimeError, type ErrorCode } from './errors.js';
+export { RuntimeError, type ErrorCode, type RemoteErrorInfo, type ErrorDetail } from './errors.js';
 export {
   createWorkerRuntime,
   RuntimeScope,
@@ -18,6 +18,8 @@ export type {
   MessagePortLike,
   PoolOptions,
   PreparedInput,
+  PreparedTaskOptions,
+  SessionPreparedTaskOptions,
   Priority,
   ResultLease,
   RuntimeBudgets,
@@ -49,3 +51,9 @@ export async function consumeResult<T, R>(
 }
 
 export { packetByteLength } from './packet.js';
+
+export {
+  iterateResults,
+  type ResultIterator,
+  type ResultIterationOptions,
+} from './iterate-results.js';

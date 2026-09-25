@@ -1,15 +1,15 @@
+import { encodeError as wireError } from './remote-error.js';
 import { validateProgress } from './progress.js';
 import { yieldTask } from './yield.js';
 import { decodePacket, encodePacket, packetBytes, validateBlobTransfers } from './packet.js';
 import { ScratchArena } from './resources/scratch.js';
-import { aborted, asError, integer, required, RuntimeError } from './errors.js';
+import { aborted, integer, required, RuntimeError } from './errors.js';
 import {
   type FromWorker,
   header,
   isHeader,
   type RequestMessage,
   type ToWorker,
-  type WireError,
 } from './protocol.js';
 import { CacheStore, type ScopedCache } from './resources/cache.js';
 import type { Catalog, MessagePortLike, TaskMap } from './types.js';
@@ -44,16 +44,6 @@ export type TaskHandler<I, O> = (
 export type TaskHandlers<T extends Catalog<T>> = {
   [K in keyof T]: TaskHandler<T[K]['input'], T[K]['output']>;
 };
-
-function wireError(value: unknown): WireError {
-  const error = asError(value);
-  return {
-    code: error instanceof RuntimeError ? error.code : 'REMOTE_ERROR',
-    name: error.name,
-    message: error.message,
-    stack: error.stack,
-  };
-}
 
 /** One physical task at a time. The host does not hide an unbounded secondary queue. */
 export function serve<T extends Catalog<T> = TaskMap>(

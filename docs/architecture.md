@@ -97,7 +97,7 @@ consumer release
 - 结果额度充足
 - 非丢弃任务有可用租约名额
 
-prepare 只执行短小的同步输入构造，异步准备由 Worker handler 完成。队列中的闭包仍可能捕获用户数据，生产者也应采用有限提交窗口。预算管理申报量和协议数据，实际 JS 堆占用由应用结合运行环境测量。
+prepare 执行短小的同步输入构造；enqueuePrepared 将受预算约束的异步生产安排在 Worker 准入之前。队列中的闭包仍可能捕获用户数据，生产者也应采用有限提交窗口。预算管理申报量和协议数据，实际 JS 堆占用由应用结合运行环境测量。
 
 ## 4. 优先级与公平调度
 
@@ -360,7 +360,7 @@ await ctx.cache.delete(key)
 
 ## 13. 协议
 
-协议版本为 4，Runtime 与 Host 必须使用同一版本。消息还携带 Worker epoch：
+协议版本为 5，Runtime 与 Host 必须使用同一版本。消息还携带 Worker epoch：
 
 ```text
 hello

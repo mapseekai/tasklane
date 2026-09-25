@@ -28,7 +28,7 @@ try {
 }
 ```
 
-示例每个文件创建一个 Session，用 setResource 保存文件引用与游标；每次只发出一个 next 任务。消费完当前块才释放租约并请求下一块，break、消费者异常和 AbortSignal 取消都会关闭 Scope。文件读取使用 Blob.slice().arrayBuffer()；取消会等待已开始的原生读取返回，再检查取消信号。检查通过后才推进游标并交付结果。
+公共 iterateResults 可直接从 npm 包导入，示例使用它管理拉取和租约。示例每个文件创建一个 Session，用 setResource 保存文件引用与游标；每次只发出一个 next 任务。消费完当前块才释放租约并请求下一块，break、消费者异常和 AbortSignal 取消都会关闭 Scope。文件读取使用 Blob.slice().arrayBuffer()；取消会等待已开始的原生读取返回，再检查取消信号。检查通过后才推进游标并交付结果。
 
 示例为游标和文件引用申报 128 字节费用；文件存储和 reader 的实际内存由应用另行评估。读取产生的 64 KiB buffer 属于该任务预留的输出空间；真实解码器的额外数组、WASM 内存和缓存要另计。主线程保留已消费块时，由接收方接管这些引用的预算和释放责任。
 
@@ -72,6 +72,12 @@ Runtime 由应用持有，各业务模块仅销毁自己的 Scope。Runtime 统�
 
 ## 异步打包与大对象图
 
-prepare 保持同步。业务必须在开始异步打包前取得有界生产窗口名额，并限制预打包数据的字节数。enqueue 前已分配的数据由生产窗口管理；耗时打包应优先移入 Worker。
+同步构造使用 prepare；异步打包使用 enqueuePrepared，在 prepareAsync 启动前取得准备窗口名额和任务额度。通过 preparationScratchBytes 声明准备临时内存，通过 budget.inputBytes 声明跨阶段保留的输入。计算密集的打包适合移入 Worker。
 
 大型数据优先使用二进制编码，并为输入、输出两条路径分别声明预算和缓冲区所有权。classic Worker 需显式配置 `{ type: 'classic' }` 并将 host 打入 Worker 产物。
+
+## 公共拉取接口
+
+从 `@mapseekai/tasklane` 导入 `iterateResults`，配置 next、isDone 和 close。next 返回 TaskHandle，isDone 判断结束标记，close 定义本次消费的清理范围。自建 Scope/Session 时在 close 中 dispose；借用 Session 时关闭本次游标，Session 的所有权保留给调用方。详细示例见 [API](api.md#分块结果迭代)。
+
+每次 next 在归还上一块租约后发起一个请求。return、dispose 和 AbortSignal 都结束当前租约；中止在 yield 暂停期间也会启动清理。调用方保留的数据引用随之由调用方计账。消费者应逐次 await next，使用 for await 可在 break 或异常时自动 return；手工拉取应在 finally 中 dispose。closed 提供物理请求完成和清理结果，清理失败会拒绝；业务失败与清理失败同时发生时通过 AggregateError 保留两者。

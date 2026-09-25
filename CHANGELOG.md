@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-beta.3 — 2026-09-25
+
+- Protocol v5: structured, bounded remote business error metadata.
+- Budgeted asynchronous input preparation before Worker admission.
+- Public result iteration with deterministic lease and cursor cleanup.
+- Simplified task completion state and shared test/benchmark helpers.
+
 ## 0.1.0-beta.2 — 2026-09-25
 
 - Protocol v4: bounded Blob/File attachments with preserved File metadata across browser and Node workers.

@@ -3,6 +3,22 @@ import { transferBuffers } from '../../dist/index.js';
 import { convert, flatten } from '../../benchmarks/workloads.mjs';
 
 export const handlers = {
+  cursorNext(_input, ctx) {
+    const value = ctx.cache.get('cursor') ?? 0;
+    ctx.cache.set('cursor', value + 1, 8);
+    return output(value < 2 ? value : null);
+  },
+  cursorClose(_input, ctx) {
+    ctx.cache.delete('cursor');
+    return output(null);
+  },
+  businessError() {
+    throw Object.assign(new Error('Read limit exceeded'), {
+      name: 'DataError',
+      code: 'READ_BUDGET',
+      details: { limit: 32 },
+    });
+  },
   oversizedOutput() {
     return output('x'.repeat(2_000_000));
   },

@@ -18,7 +18,7 @@ Runtime 面向可信 Worker。使用 serve 在发送前校验协议消息和额�
 
 ## 调度
 
-默认 `maxActiveTasks = min(pool capacity, maxWorkers)`，包括启动、准备和执行。等待队列默认最多 1024 项；生产者使用有限提交窗口可以控制业务侧 Promise 和闭包数量。
+默认 `maxActiveTasks = min(pool capacity, maxWorkers)`，包括 Worker 启动、同步 prepare 和执行。等待队列默认最多 1024 项；生产者使用有限提交窗口可以控制业务侧 Promise 和闭包数量。
 
 调度器按优先级、Scope/group 的服务历史选择任务，同一优先级、组、Pool/Session 通道内保持 FIFO。不同 Pool/Session 的阻塞头部互不遮挡。默认 `priorityPolicy: 'strict'`，可准入的 interactive 始终优先于 background。显式设置 `priorityPolicy: 'ageing'` 后，每 `ageingMs` 提升一级，后台最终可与交互任务同级。两种策略均在任务准入时决定顺序，已执行任务持续运行至完成或取消；严格优先级下低优先级任务可能长期等待。空闲组历史最多保留 4096 项，新组以当前服务时钟初始化，流式补充沿用服务历史参与公平调度。
 
@@ -36,7 +36,7 @@ Runtime 面向可信 Worker。使用 serve 在发送前校验协议消息和额�
 
 `scope.dispose()` 等待任务、子 Scope、Session 以及对应 Worker 的释放确认。释放 ACK 按 Scope ID 和 Worker epoch 匹配，默认 `releaseTimeoutMs = 10000`；缺失 ACK 或资源清理失败会拒绝，调用方可以再次尝试 Scope 销毁。确认物理 Worker 已退出也会完成该实例的释放屏障。
 
-`runtime.disposeWithin(ms)` / `scope.disposeWithin(ms)` 只限制调用者等待时间；后台清理继续运行。清理完成以 dispose 的最终结果或物理终止确认为准。`prepare` 用于同步、短小的输入构造；返回 Promise/thenable 会立即以 INVALID_ARGUMENT 拒绝并归还准入额度。异步加载和昂贵计算必须放到 Worker handler 内。回调自行负责已启动的异步副作用；主线程同步代码需及时返回以保持事件循环响应。同步构造返回后还会检查执行截止时间。
+`runtime.disposeWithin(ms)` / `scope.disposeWithin(ms)` 只限制调用者等待时间；后台清理继续运行。清理完成以 dispose 的最终结果或物理终止确认为准。`prepare` 用于同步、短小的输入构造；返回 Promise/thenable 会立即以 INVALID_ARGUMENT 拒绝并归还准入额度。异步输入准备使用 enqueuePrepared 的 prepareAsync；计算密集工作适合放在 Worker handler 内。回调自行负责已启动的异步副作用；主线程同步代码需及时返回以保持事件循环响应。同步构造返回后还会检查执行截止时间。
 
 物理终止失败会保留槽位和额度，`stats.quarantinedWorkers` 可观察该状态。外部故障解除后调用 `runtime.retryTermination()`，确认终止成功后才清理；随后可以再次调用 `runtime.dispose()`。
 
@@ -63,7 +63,7 @@ context.progress 的发送生命周期随任务结束而关闭，结束后的 ch
 
 逻辑取消与物理阶段独立：启动期取消仍受 execution deadline 约束；已经发送的 Worker 任务到期会强制终止；prepare 采用同步构造契约。
 
-协议版本为 4，payload/result 使用 Packet 封装，request 携带 maxScratchBytes。自定义 endpoint 必须支持 progress ACK 与 Scope release ACK。底层传输和异步 disposer 的失败会传递给释放调用方，供其处理或重试。
+协议版本为 5，payload/result 使用 Packet 封装，request 携带 maxScratchBytes。自定义 endpoint 必须支持 progress ACK 与 Scope release ACK。底层传输和异步 disposer 的失败会传递给释放调用方，供其处理或重试。
 
 ## File/Blob 附件
 
@@ -74,3 +74,19 @@ File/Blob 使用独立附件表；每个消息最多 256 个不同对象，重�
 File 的 name/type/lastModified 和重复引用得到保留；Blob/File 按原生文件属性传递，额外业务字段应放在外层普通对象中；附件通过克隆传递，transfer list 用于可转移对象。Node 通道通过 Blob 附件和显式 File 元数据恢复 File。File 解码要求运行环境提供 File 构造器。文件数据通过任务输入或结果传递；常驻文件引用用 Session setResource，声明引用/reader 开销并单独管理逻辑文件大小。
 
 读取后产生的 ArrayBuffer、解码临时内存和跨任务缓存仍需各自申报。ResultLease.release 清除租约持有的引用并返还消息额度；调用方另存的 File/Blob 由其持有者负责释放引用，底层存储由运行环境回收。完整示例见 [文件与分块使用指南](file-and-session.md)。
+
+## 异步准备阶段
+
+`enqueuePrepared` 在调用 prepareAsync 前，原子预留任务 inputBytes、outputBytes 和 `max(preparationScratchBytes, budget.scratchBytes)`，并预占结果租约名额。该完整额度持续持有至物理任务结束，输出部分随后交给 ResultLease。准备临时数据在回调完成前释放，跨阶段保留的数据计入 inputBytes。此方式为准备到执行提供连续额度，业务使用声明的上界约束自身分配。
+
+`maxPreparingTasks` 默认 2，合计约束正在生产和已准备、等待 Worker 的输入。Worker 在执行准入时绑定。准备和等待发送仍计入 stats.queued 与 maxQueuedTasks；同一优先级、Scope/group、Pool/Session 通道按 FIFO 准入，其他通道可独立准备。
+
+queueTimeoutMs 约束首次准入前的等待；executionTimeoutMs 从准备准入开始覆盖生产、等待 Worker、启动和执行；preparationTimeoutMs 单独约束生产回调，默认采用 executionTimeoutMs。取消/超时立即拒绝 result，回调物理结束后释放准备资源；迟到输入保持原缓冲区所有权。回调应通过 signal 协作退出并完成其临时资源清理。持续未完成的回调保持额度与清理屏障，可通过 disposeWithin 和 resourceDiagnostics 观察。
+
+stats.preparing / prepared 分别统计生产中和等待发送的输入；preparationReserved 展示这些输入持有的完整任务额度，已包含在 reserved 中。resourceDiagnostics 的 preparing / prepared 提供对应任务 ID。settled 在生产或 Worker 的物理生命周期结束后兑现。
+
+## 业务错误
+
+远端失败以 RuntimeError 传递，code 表示 Runtime 错误类别；remoteError 保存业务 name、字符串 code、message 及可选 stack/details。基本字段从数据属性读取；name/code 最多 128 字符、message 1024 字符、stack 4096 字符，截断时标记 truncated。details 接受有限数字、字符串、布尔值、null、普通对象和数组，最多 8 层、128 次计费访问和 4 KiB 计费量；编码超限或类型不符时标记 detailsOmitted，并保留基本错误。整个错误消息使用独立的有界控制额度。
+
+Host 在发送前整理错误，Runtime 接收时复核错误码、字段和限额。业务失败使用 REMOTE_ERROR，物理 Worker 故障与取消分别使用 WORKER_FAILED 和 ABORTED。业务根据 remoteError 重建自己的错误类型。

@@ -159,7 +159,11 @@ export class Scheduler<T extends ScheduledJob> {
     this.events.set(job, event);
     this.promotions.add(event);
   }
-  select(now: number, eligible: (job: T) => boolean): T | undefined {
+  select(
+    now: number,
+    eligible: (job: T) => boolean,
+    charge: (job: T) => boolean = () => true,
+  ): T | undefined {
     while (this.promotions.first && this.promotions.first.at <= now) {
       const event = this.promotions.first;
       this.promotions.remove(event);
@@ -184,6 +188,7 @@ export class Scheduler<T extends ScheduledJob> {
         skipped.push(bucket);
         const job = bucket.jobs.first!;
         if (!eligible(job)) continue;
+        if (!charge(job)) return job;
         // Update every bucket of this group before the next selection.
         for (const b of bucket.group.buckets.values()) this.ready.remove(b);
         bucket.group.served = ++this.clock;

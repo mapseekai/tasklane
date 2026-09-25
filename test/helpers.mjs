@@ -1,4 +1,4 @@
-import { createWorkerRuntime } from '../dist/index.js';
+import { createWorkerRuntime, consumeResult } from '../dist/index.js';
 import { nodeWorker } from '../dist/adapters/node.js';
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export function options(payload, extra = {}) {
@@ -26,14 +26,7 @@ export function runtime(extra = {}) {
     ...extra,
   });
 }
-export async function take(handle) {
-  const lease = await handle.result;
-  try {
-    return lease.value;
-  } finally {
-    lease.release();
-  }
-}
+export const take = (handle) => consumeResult(handle, (value) => value);
 export async function until(predicate, limit = 2000) {
   const started = performance.now();
   while (!predicate()) {

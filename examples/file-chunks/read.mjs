@@ -1,4 +1,4 @@
-import { consumeResult } from '../../dist/index.js';
+import { consumeResult, iterateResults } from '../../dist/index.js';
 import { CHUNK_BYTES } from './handlers.mjs';
 
 /** The caller owns Runtime and provides a pool named "files" with cacheBytes >= 128.
@@ -17,19 +17,17 @@ export async function* readFileChunks(runtime, file, { signal } = {}) {
       }),
       () => {},
     );
-    while (true) {
-      const lease = await session.enqueue('fileNext', {
-        budget: { inputBytes: 0, scratchBytes: 0, outputBytes: CHUNK_BYTES },
-        prepare: () => ({ payload: null }),
-        signal,
-      }).result;
-      try {
-        if (lease.value === null) return;
-        yield lease.value;
-      } finally {
-        lease.release();
-      }
-    }
+    yield* iterateResults({
+      signal,
+      next: (signal) =>
+        session.enqueue('fileNext', {
+          budget: { inputBytes: 0, scratchBytes: 0, outputBytes: CHUNK_BYTES },
+          prepare: () => ({ payload: null }),
+          signal,
+        }),
+      isDone: (value) => value === null,
+      close: () => scope.dispose(),
+    });
   } finally {
     await scope.dispose();
   }

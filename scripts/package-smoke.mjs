@@ -35,14 +35,14 @@ try {
     `
 import { serve, output } from '@mapseekai/tasklane/host';
 import { nodeHost } from '@mapseekai/tasklane/node';
-serve(nodeHost(), { double(values) { const result = Float64Array.from(values, (n) => n * 2); return output(result, [result.buffer]); } });
+serve(nodeHost(), { fail() { throw Object.assign(new Error('failed'), { name: 'DataError', code: 'DOMAIN_FAILURE' }); }, double(values) { const result = Float64Array.from(values, (n) => n * 2); return output(result, [result.buffer]); } });
 `,
   );
   await writeFile(
     join(directory, 'smoke.mjs'),
     `
 import assert from 'node:assert/strict';
-import { createWorkerRuntime, transferBuffers, packetByteLength, dataByteLength } from '@mapseekai/tasklane';
+import { createWorkerRuntime, transferBuffers, packetByteLength, dataByteLength, iterateResults, consumeResult } from '@mapseekai/tasklane';
 assert.equal(packetByteLength('abcd'), 8);
 assert.equal(dataByteLength('abcd'), 8);
 import { nodeWorker } from '@mapseekai/tasklane/node';
@@ -51,6 +51,15 @@ const values = new Float64Array([1, 2, 3]);
 try {
  const lease = await rt.createScope().enqueue('double', { pool: 'cpu', budget: { inputBytes: 24, scratchBytes: 0, outputBytes: 24 }, prepare: () => ({ payload: values, transfer: transferBuffers(values) }) }).result;
  assert.deepEqual(Array.from(lease.value), [2, 4, 6]); assert.equal(values.byteLength, 0); lease.release();
+ const scope = rt.createScope();
+ const base = { pool: 'cpu', budget: { inputBytes: 24, scratchBytes: 0, outputBytes: 24 } };
+ await consumeResult(scope.enqueuePrepared('double', { ...base, preparationScratchBytes: 24, prepareAsync: async () => ({ payload: new Float64Array([4]) }) }), (v) => assert.equal(v[0], 8));
+ await assert.rejects(scope.enqueue('fail', { ...base, prepare: () => ({ payload: null }) }).result, (e) => e.code === 'REMOTE_ERROR' && e.remoteError.code === 'DOMAIN_FAILURE');
+ let pulls = 0;
+ const iterator = iterateResults({ next: () => scope.enqueue('double', { ...base, prepare: () => ({ payload: new Float64Array([pulls++]) }) }), isDone: (v) => v[0] >= 2, close: () => scope.dispose() });
+ const chunks = [];
+ for await (const chunk of iterator) chunks.push(chunk[0]);
+ assert.deepEqual(chunks, [0]); await iterator.closed;
 } finally { await rt.dispose(); }
 assert.equal(rt.stats.workers, 0);
 `,

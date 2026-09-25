@@ -4,6 +4,108 @@ test.beforeEach(async ({ page }) => {
   await page.goto('/test/browser/harness.html');
 });
 
+test('budgeted preparation, remote errors and public pull helper use real Workers', async ({
+  page,
+}) => {
+  const actual = await page.evaluate(async () => {
+    const { createWorkerRuntime, browserWorker, consumeResult, iterateResults } = await import(
+      '/dist/index.js'
+    );
+    const rt = createWorkerRuntime({
+      pools: {
+        cpu: {
+          size: 1,
+          cacheBytes: 128,
+          factory: browserWorker('/test/fixtures/browser-worker.mjs'),
+        },
+      },
+    });
+    const scope = rt.createScope();
+    const base = { pool: 'cpu', budget: { inputBytes: 4096, scratchBytes: 0, outputBytes: 4096 } };
+    let release, begin;
+    const gate = new Promise((r) => {
+      release = r;
+    });
+    const started = new Promise((r) => {
+      begin = r;
+    });
+    try {
+      const task = scope.enqueuePrepared('ping', {
+        ...base,
+        preparationScratchBytes: 16,
+        prepareAsync: async () => {
+          begin();
+          await gate;
+          return { payload: 42 };
+        },
+      });
+      await started;
+      const during = {
+        workers: rt.stats.workers,
+        input: rt.stats.reserved.inputBytes,
+        preparing: rt.stats.preparing,
+      };
+      release();
+      const value = await consumeResult(task, (v) => v.value);
+      let error;
+      try {
+        await scope.enqueue('businessError', { ...base, prepare: () => ({ payload: null }) })
+          .result;
+      } catch (e) {
+        error = {
+          code: e.code,
+          name: e.remoteError.name,
+          remoteCode: e.remoteError.code,
+          details: e.remoteError.details,
+        };
+      }
+      const session = scope.session('cpu');
+      const chunks = [];
+      const iterator = iterateResults({
+        next: (signal) =>
+          session.enqueue('cursorNext', { ...base, prepare: () => ({ payload: null }), signal }),
+        isDone: (v) => v === null,
+        close: () =>
+          consumeResult(
+            session.enqueue('cursorClose', { ...base, prepare: () => ({ payload: null }) }),
+            () => {},
+          ),
+      });
+      for await (const item of iterator) chunks.push(item);
+      const borrowed = session.state;
+      await scope.dispose();
+      return {
+        during,
+        value,
+        error,
+        chunks,
+        borrowed,
+        scopes: rt.stats.scopes,
+        leases: rt.stats.leases,
+        bytes: rt.stats.reserved,
+      };
+    } finally {
+      release();
+      await rt.dispose();
+    }
+  });
+  expect(actual).toEqual({
+    during: { workers: 0, input: 4096, preparing: 1 },
+    value: 42,
+    error: {
+      code: 'REMOTE_ERROR',
+      name: 'DataError',
+      remoteCode: 'READ_BUDGET',
+      details: { limit: 32 },
+    },
+    chunks: [0, 1],
+    borrowed: 'bound',
+    scopes: 0,
+    leases: 0,
+    bytes: { inputBytes: 0, scratchBytes: 0, outputBytes: 0, cacheBytes: 0 },
+  });
+});
+
 test('File metadata, range reads, logical limits and pull-session cleanup in a real Worker', async ({
   page,
 }) => {

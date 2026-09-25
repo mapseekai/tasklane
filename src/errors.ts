@@ -1,29 +1,50 @@
 /** Stable error codes are part of the public contract; messages are diagnostic. */
-export type ErrorCode =
-  | 'ABORTED'
-  | 'CLOSED'
-  | 'QUEUE_FULL'
-  | 'QUEUE_TIMEOUT'
-  | 'EXECUTION_TIMEOUT'
-  | 'STARTUP_TIMEOUT'
-  | 'WORKER_FAILED'
-  | 'PROTOCOL_ERROR'
-  | 'UNKNOWN_TASK'
-  | 'BUDGET_EXCEEDED'
-  | 'INVALID_ARGUMENT'
-  | 'SESSION_LOST'
-  | 'HARD_CANCEL_DENIED'
-  | 'RESULT_RELEASED'
-  | 'REMOTE_ERROR';
+export const ERROR_CODES = [
+  'ABORTED',
+  'CLOSED',
+  'QUEUE_FULL',
+  'QUEUE_TIMEOUT',
+  'EXECUTION_TIMEOUT',
+  'STARTUP_TIMEOUT',
+  'WORKER_FAILED',
+  'PROTOCOL_ERROR',
+  'UNKNOWN_TASK',
+  'BUDGET_EXCEEDED',
+  'INVALID_ARGUMENT',
+  'SESSION_LOST',
+  'HARD_CANCEL_DENIED',
+  'RESULT_RELEASED',
+  'REMOTE_ERROR',
+] as const;
+export type ErrorCode = (typeof ERROR_CODES)[number];
+
+export type ErrorDetail =
+  | null
+  | boolean
+  | number
+  | string
+  | ErrorDetail[]
+  | { [key: string]: ErrorDetail };
+export interface RemoteErrorInfo {
+  name: string;
+  code?: string;
+  message: string;
+  stack?: string;
+  details?: ErrorDetail;
+  detailsOmitted?: boolean;
+  truncated?: boolean;
+}
 
 export class RuntimeError extends Error {
   override readonly name = 'RuntimeError';
+  readonly remoteError?: Readonly<RemoteErrorInfo>;
   constructor(
     readonly code: ErrorCode,
     message: string,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { remoteError?: RemoteErrorInfo },
   ) {
     super(message, options);
+    this.remoteError = options?.remoteError;
   }
 }
 

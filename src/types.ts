@@ -25,6 +25,7 @@ export type TaskState =
   | 'queued'
   | 'starting'
   | 'preparing'
+  | 'prepared'
   | 'running'
   | 'cancelling'
   | 'succeeded'
@@ -53,7 +54,7 @@ export interface TaskOptions<Input> {
   budget: TaskBudget;
   /** Per-packet logical Blob/File sizes; defaults to zero. Not reserved heap/RSS credits. */
   blobLimits?: { inputBytes: number; outputBytes: number };
-  /** Synchronous input construction only. Run asynchronous or expensive preparation inside the Worker. */
+  /** Synchronous input construction. Use enqueuePrepared for asynchronous input preparation. */
   prepare(context: { signal: AbortSignal }): PreparedInput<Input>;
   priority?: Priority;
   /** Fairness is per scope + group, not merely per task. */
@@ -69,6 +70,21 @@ export interface TaskOptions<Input> {
   discardResult?: boolean;
   onProgress?: (value: unknown) => void;
 }
+
+/** Budgeted asynchronous production before Worker admission. */
+export interface PreparedTaskOptions<Input> extends Omit<TaskOptions<Input>, 'prepare'> {
+  prepareAsync(context: {
+    signal: AbortSignal;
+  }): PreparedInput<Input> | Promise<PreparedInput<Input>>;
+  /** Main-realm temporary data upper bound; reserved together with the task budget. */
+  preparationScratchBytes: number;
+  /** Bounds the producer phase; executionTimeoutMs covers all admitted phases together. */
+  preparationTimeoutMs?: number;
+}
+export type SessionPreparedTaskOptions<Input> = Omit<
+  PreparedTaskOptions<Input>,
+  'pool' | 'affinity'
+>;
 
 export type SessionTaskOptions<Input> = Omit<TaskOptions<Input>, 'pool' | 'affinity'>;
 
@@ -115,6 +131,8 @@ export interface RuntimeOptions {
   pools: Record<string, PoolOptions>;
   maxWorkers?: number;
   maxActiveTasks?: number;
+  /** Bounds asynchronous producers plus prepared inputs waiting for a Worker. Default 2. */
+  maxPreparingTasks?: number;
   maxQueuedTasks?: number;
   /** Bounds held leases plus admitted work, including zero-binary-byte results. */
   maxResultLeases?: number;
@@ -138,6 +156,10 @@ export interface RuntimeOptions {
 export interface RuntimeStats {
   queued: number;
   active: number;
+  preparing: number;
+  prepared: number;
+  /** Reserved input/scratch/output envelopes of preparing and prepared tasks. */
+  preparationReserved: TaskBudget;
   workers: number;
   closingWorkers: number;
   leases: number;

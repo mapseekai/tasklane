@@ -28,8 +28,9 @@ const runtime = createWorkerRuntime({
 | 配置 | 默认值 | 作用 |
 | --- | ---: | --- |
 | `maxWorkers` | 所有 Pool size 之和 | Runtime 最大物理 Worker 数 |
-| `maxActiveTasks` | `min(pool capacity, maxWorkers)` | 同时处于启动、准备或执行阶段的任务数 |
-| `maxQueuedTasks` | 1024 | 等待准入的任务数量 |
+| `maxPreparingTasks` | 2 | 异步生产与已准备输入的总窗口 |
+| `maxActiveTasks` | `min(pool capacity, maxWorkers)` | 同时处于 Worker 启动、同步 prepare 或执行阶段的任务数 |
+| `maxQueuedTasks` | 1024 | 等待 Worker 执行准入的任务数量，包含异步准备与已准备输入 |
 | `budgets.inputBytes` | 64 MiB | 输入数据总额度 |
 | `budgets.scratchBytes` | 128 MiB | 算法暂存总额度 |
 | `budgets.outputBytes` | 64 MiB | 执行中和待消费结果总额度 |
@@ -567,7 +568,7 @@ await runtime.retryTermination(); // 重试物理终止失败的隔离 Worker
 await runtime.disposeWithin(5000); // 限制等待时间；超时后后台清理继续进行
 ```
 
-`scope.disposeWithin(ms)` 同样只约束等待时间，Session 使用 dispose。协议 v4 的 request 携带 Packet payload、maxOutputBytes、maxOutputBlobBytes 和 maxScratchBytes；progress 使用 ACK，Scope 释放也需要 ACK。
+`scope.disposeWithin(ms)` 同样只约束等待时间，Session 使用 dispose。协议 v5 的 request 携带 Packet payload、maxOutputBytes、maxOutputBlobBytes 和 maxScratchBytes；progress 使用 ACK，Scope 释放也需要 ACK。
 
 详见 [资源与调度契约](resources.md)，包括元数据限制、`budgetWaitMs`、`releaseTimeoutMs`、进度 ACK、Scope 释放确认、`withScope`、`disposeWithin`、`resourceDiagnostics` 和 `retryTermination`。
 
@@ -583,3 +584,71 @@ scope.enqueue('open', {
 ```
 
 可选 `{ inputBytes: number; outputBytes: number }`，省略时均为 0；提供对象时两项都必填。限制每包 File/Blob 逻辑大小，重复对象仅计一次，与全局 inputBytes/outputBytes 额度独立。4096 只是此短文件名示例的元数据上限，超长文件名需要更高预算。`packetByteLength(file)` 返回引用与元数据费用，file.size 由 blobLimits 单独校验。Scope 与 Session 任务均支持，附件通过克隆传递。语义及限制见 [资源契约](resources.md#fileblob-附件)。
+
+## 异步输入准备
+
+Scope 与 Session 都提供 `enqueuePrepared(name, options)`，返回原有 TaskHandle：
+
+```ts
+const task = scope.enqueuePrepared('convert', {
+  pool: 'compute',
+  budget: { inputBytes: 8 * MiB, scratchBytes: 16 * MiB, outputBytes: 8 * MiB },
+  preparationScratchBytes: 4 * MiB,
+  preparationTimeoutMs: 30_000,
+  executionTimeoutMs: 120_000,
+  prepareAsync: async ({ signal }) => {
+    const bytes = await loadInput(signal);
+    signal.throwIfAborted();
+    return { payload: bytes, transfer: transferBuffers(bytes) };
+  },
+});
+await consumeResult(task, consumeOutput);
+```
+
+示例中的 loadInput 和 consumeOutput 由应用提供，输入需满足声明的大小与所有权。`PreparedTaskOptions` 保留 TaskOptions 的预算、优先级、group、affinity、取消、超时和 progress 配置，使用 prepareAsync 构造输入。Session 使用 `SessionPreparedTaskOptions`，由其绑定关系提供 pool 和亲和性。
+
+Runtime 配置 `maxPreparingTasks`（默认 2）限制生产中及等待发送的输入数量。完整任务额度在 prepareAsync 执行前预留，scratch 按准备与执行的较大上界计费；准备阶段按结果消费速度接续执行，Worker 在执行准入时绑定。状态依次为 queued、preparing、prepared、starting、running，取消和失败沿用 TaskHandle 的生命周期。
+
+`queueMs` 记录首次准入前的等待，`prepareMs` 记录生产回调时间，`startupMs` 记录绑定 Worker 后的启动等待；`totalMs` 包括准备完成后等待 Worker 的时间。取消后通过 result 获知逻辑结果，通过 settled 等待生产与任务的物理完成。额度和计时细节见 [资源契约](resources.md#异步准备阶段)。
+
+## 远端业务错误
+
+```ts
+try {
+  await task.result;
+} catch (error) {
+  if (error instanceof RuntimeError && error.code === 'REMOTE_ERROR') {
+    console.log(error.remoteError?.name, error.remoteError?.code);
+    console.log(error.remoteError?.message, error.remoteError?.details);
+  }
+}
+```
+
+`remoteError` 类型为 `Readonly<RemoteErrorInfo>`，支持 name、字符串 code、message，以及可选 stack、details、truncated、detailsOmitted。details 类型为递归的 ErrorDetail。Worker 抛出的 Error 可通过普通数据属性携带业务 code/details。字段与大小规则见 [业务错误契约](resources.md#业务错误)。
+
+## 分块结果迭代
+
+```ts
+import { iterateResults, consumeResult } from '@mapseekai/tasklane';
+
+const chunks = iterateResults({
+  signal,
+  next: (signal) => session.enqueue('next', {
+    budget: chunkBudget,
+    prepare: () => ({ payload: { cursorId } }),
+    signal,
+  }),
+  isDone: (value) => value.done,
+  close: () => consumeResult(session.enqueue('closeCursor', closeOptions), () => {}),
+});
+for await (const chunk of chunks) {
+  await consumeChunk(chunk);
+}
+await chunks.closed;
+```
+
+示例使用应用定义的 next/closeCursor 任务、cursorId、chunkBudget、closeOptions 与 consumeChunk，并借用 session；closeOptions 应使用可执行清理的信号。helper 自建资源时可将 close 配置为所属 Scope/Session 的 dispose。
+
+`iterateResults<T>(ResultIterationOptions<T>)` 返回 `ResultIterator<T>`，支持 AsyncIterableIterator、dispose() 与 closed。isDone 为 true 的结束标记在内部释放；其他值逐块交给消费者。下一次 next、return、dispose 或 AbortSignal 都会结束当前租约。并发 next 以 INVALID_ARGUMENT 拒绝，消费者逐次请求即可保持单块在途。
+
+break 和消费者异常通过迭代器 return 清理；手工 next 使用 finally + dispose。终止时取消当前请求并等待 settled，再调用 close 一次。closed 表示物理请求与清理完成，清理失败可通过该 Promise 观察。消费者保留块引用时需接管其内存预算。

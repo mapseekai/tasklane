@@ -7,14 +7,8 @@ import { header } from '../dist/protocol.js';
 import { CacheStore } from '../dist/resources/cache.js';
 import { Scheduler } from '../dist/runtime/scheduler.js';
 import { nodeWorker } from '../dist/adapters/node.js';
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const opts = (payload = null, extra = {}) => ({
-  pool: 'cpu',
-  budget: { inputBytes: 4096, scratchBytes: 0, outputBytes: 4096 },
-  prepare: () => ({ payload }),
-  ...extra,
-});
-const take = (handle) => consumeResult(handle, (value) => value);
+import { sleep, options, take } from './helpers.mjs';
+const opts = (payload = null, extra = {}) => options(payload, extra);
 async function until(predicate) {
   for (let i = 0; i < 1000; i++) {
     if (predicate()) return;

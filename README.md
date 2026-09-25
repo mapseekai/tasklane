@@ -74,7 +74,7 @@ Session 适合需要长期绑定同一 Worker 的运行时：
 
 ## 安装与验证
 
-当前预发布版本为 `0.1.0-beta.1`，适合业务试点接入。仓库构建和 Node 示例需要 Node.js 22+ 与 pnpm，浏览器端使用 Web Worker。
+当前预发布版本为 `0.1.0-beta.2`，适合业务试点接入。仓库构建和 Node 示例需要 Node.js 22+ 与 pnpm，浏览器端使用 Web Worker。
 
 ```sh
 npm install @mapseekai/tasklane@beta
@@ -166,7 +166,7 @@ try {
       priority: 'interactive',
       group: 'layer-roads',
       affinity: 'dataset-a/shard-1',
-      // 根 TypedArray 没有对象包元数据，只计完整 backing store。
+      // 根 TypedArray 按完整 backing store 计费。
       budget: { inputBytes: 8 * MiB, scratchBytes: 0, outputBytes: 4 * MiB },
       prepare: ({ signal }) => {
         signal.throwIfAborted();
@@ -256,8 +256,10 @@ Session：用于长期状态型运行时
 
 任务预算包括字符串、普通数组和协议元数据，使用 `packetByteLength(value)` 计算传输计费量；复合 TypedArray 包还需预留少量元数据空间。结果在首次读取 `lease.value` 时解码。默认采用严格优先级，需要跨优先级老化时设置 `priorityPolicy: 'ageing'`。
 
-`prepare` 只接受同步输入构造，异步加载或昂贵准备在 Worker handler 内执行。`ctx.scratch` 提供受额度限制的临时 ArrayBuffer；普通 JS 分配和外部资源仍由算法管理。Runtime 运行可信 Worker，不是进程内存沙箱。完整语义见 [资源与调度契约](docs/resources.md)。
+`prepare` 只接受同步输入构造，异步加载或昂贵准备在 Worker handler 内执行。`ctx.scratch` 提供受额度限制的临时 ArrayBuffer；普通 JS 分配和外部资源仍由算法管理。Runtime 面向可信 Worker，管理任务准入、协议数据与显式申报的资源额度。完整语义见 [资源与调度契约](docs/resources.md)。
 
 ## License
 
 MIT
+
+File/Blob 可作为受约束附件传入或返回，通过任务 `blobLimits` 声明逻辑大小上限，并支持在 Worker 内按范围读取。详见 [文件与分块使用指南](docs/file-and-session.md)。

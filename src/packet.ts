@@ -4,11 +4,17 @@ type BufferStore = ArrayBuffer | SharedArrayBuffer;
 export type Packet =
   | { kind: 'scalar'; value: null | undefined | boolean | number | bigint | string }
   | { kind: 'binary'; value: BufferStore | ArrayBufferView }
-  | { kind: 'graph'; metadata: string; buffers: BufferStore[] };
+  | { kind: 'graph'; metadata: string; buffers: BufferStore[]; blobs: Blob[] };
 const MAX_NODES = 100_000;
 const MAX_EDGES = 1_000_000;
 const MAX_METADATA = 64 * 1024 ** 2;
 const MAX_BUFFERS = 4096;
+const MAX_BLOBS = 256;
+const isBlob = (value: unknown): value is Blob =>
+  typeof Blob !== 'undefined' && value instanceof Blob;
+const blobSize = (value: Blob): number => intrinsic(Blob.prototype, 'size', value);
+const blobType = (value: Blob): string =>
+  Object.getOwnPropertyDescriptor(Blob.prototype, 'type')!.get!.call(value) as string;
 const typedProto = Object.getPrototypeOf(Uint8Array.prototype);
 const intrinsic = (proto: object, name: string, value: object): number =>
   Object.getOwnPropertyDescriptor(proto, name)!.get!.call(value) as number;
@@ -52,6 +58,9 @@ type Node = {
   items?: Token[];
   length?: number;
   buffer?: number;
+  blob?: number;
+  name?: string;
+  lastModified?: number;
   offset?: number;
   size?: number;
   value?: string;
@@ -90,12 +99,18 @@ export function packetBytes(raw: unknown): number {
     packet.kind !== 'graph' ||
     typeof packet.metadata !== 'string' ||
     !Array.isArray(packet.buffers) ||
-    packet.buffers.length > MAX_BUFFERS
+    packet.buffers.length > MAX_BUFFERS ||
+    !Array.isArray(packet.blobs) ||
+    packet.blobs.length > MAX_BLOBS
   )
     return failure('Invalid graph packet');
   let bytes = packet.metadata.length * 2;
   if (bytes > MAX_METADATA)
     throw new RuntimeError('BUDGET_EXCEEDED', 'Packet metadata exceeds limit');
+  packetBlobBytes(packet);
+  for (const blob of packet.blobs) bytes += 64 + blobType(blob).length * 2;
+  if (bytes > MAX_METADATA)
+    throw new RuntimeError('BUDGET_EXCEEDED', 'Packet attachment metadata exceeds limit');
   const seen = new Set<BufferStore>();
   for (const buffer of packet.buffers) {
     if (!isBuffer(buffer) || seen.has(buffer)) return failure('Invalid or duplicate backing store');
@@ -106,12 +121,41 @@ export function packetBytes(raw: unknown): number {
   return bytes;
 }
 
+/** Blob/File are cloneable attachments, never transferable ownership. */
+export function validateBlobTransfers(transfer: readonly Transferable[] | undefined): void {
+  if (transfer?.some(isBlob))
+    throw new RuntimeError('INVALID_ARGUMENT', 'Blob/File cannot appear in a transfer list');
+}
+
+/** Logical attachment bytes, separate from packet/heap accounting. Repeated references count once. */
+export function packetBlobBytes(packet: Packet): number {
+  if (packet.kind !== 'graph') return 0;
+  if (!Array.isArray(packet.blobs) || packet.blobs.length > MAX_BLOBS)
+    return failure('Invalid blob table');
+  const seen = new Set<Blob>();
+  let bytes = 0;
+  for (const blob of packet.blobs) {
+    if (!isBlob(blob) || seen.has(blob)) return failure('Invalid or duplicate blob attachment');
+    seen.add(blob);
+    bytes += blobSize(blob);
+    integer(bytes, 'blob bytes');
+  }
+  return bytes;
+}
+
 /** Encode once at the sender. Metadata is a bounded flat graph; buffers retain transfer semantics. */
-export function encodePacket(value: unknown, limit = Number.MAX_SAFE_INTEGER): Packet {
+export function encodePacket(
+  value: unknown,
+  limit = Number.MAX_SAFE_INTEGER,
+  maxBlobBytes = Number.MAX_SAFE_INTEGER,
+): Packet {
   integer(limit, 'packet limit');
+  integer(maxBlobBytes, 'blob limit');
   const check = (packet: Packet): Packet => {
     if (packetBytes(packet) > limit)
       throw new RuntimeError('BUDGET_EXCEEDED', 'Packet exceeds reserved bytes');
+    if (packetBlobBytes(packet) > maxBlobBytes)
+      throw new RuntimeError('BUDGET_EXCEEDED', 'Packet exceeds logical blob byte limit');
     return packet;
   };
   if (value === null || typeof value !== 'object')
@@ -121,6 +165,8 @@ export function encodePacket(value: unknown, limit = Number.MAX_SAFE_INTEGER): P
   const pending: object[] = [];
   const nodes: Node[] = [];
   const buffers: BufferStore[] = [];
+  const blobs: Blob[] = [];
+  let logicalBlobBytes = 0;
   const bufferIds = new Map<BufferStore, number>();
   let edges = 0,
     lowerBound = 0;
@@ -193,6 +239,25 @@ export function encodePacket(value: unknown, limit = Number.MAX_SAFE_INTEGER): P
           item,
         ),
       };
+    } else if (isBlob(item)) {
+      if (blobs.length >= MAX_BLOBS)
+        throw new RuntimeError('BUDGET_EXCEEDED', 'Too many blob attachments');
+      logicalBlobBytes += blobSize(item);
+      integer(logicalBlobBytes, 'blob bytes');
+      if (logicalBlobBytes > maxBlobBytes)
+        throw new RuntimeError('BUDGET_EXCEEDED', 'Packet exceeds logical blob byte limit');
+      charge(64 + blobType(item).length * 2);
+      node = { type: 'blob', blob: blobs.length };
+      if (typeof File !== 'undefined' && item instanceof File) {
+        const name = Object.getOwnPropertyDescriptor(File.prototype, 'name')!.get!.call(
+          item,
+        ) as string;
+        const lastModified = intrinsic(File.prototype, 'lastModified', item);
+        charge(name.length * 2 + 16);
+        node = { type: 'file', blob: blobs.length, name, lastModified };
+      }
+      // Normalize File to Blob: Node's structured clone does not preserve File metadata.
+      blobs.push(Blob.prototype.slice.call(item, 0, blobSize(item), blobType(item)) as Blob);
     } else if (item instanceof Map) {
       if (intrinsic(Map.prototype, 'size', item) * 2 > MAX_EDGES - edges)
         throw new RuntimeError('BUDGET_EXCEEDED', 'Too many map entries');
@@ -238,7 +303,7 @@ export function encodePacket(value: unknown, limit = Number.MAX_SAFE_INTEGER): P
       node = { type: proto === null ? 'null-object' : 'object' };
     }
     // Typed arrays retain native structured-clone semantics; numeric indices live in the buffer.
-    if (!ArrayBuffer.isView(item)) {
+    if (!ArrayBuffer.isView(item) && !isBlob(item)) {
       node.props = [];
       for (const key in item) {
         if (!Object.hasOwn(item, key)) continue;
@@ -250,7 +315,7 @@ export function encodePacket(value: unknown, limit = Number.MAX_SAFE_INTEGER): P
     }
     nodes[cursor] = node;
   }
-  return check({ kind: 'graph', metadata: JSON.stringify({ root, nodes }), buffers });
+  return check({ kind: 'graph', metadata: JSON.stringify({ root, nodes }), buffers, blobs });
 }
 
 /** Decoding is demand-driven by ResultLease.value, outside the message listener. */
@@ -274,6 +339,23 @@ export function decodePacket(packet: Packet): unknown {
         return new Map();
       case 'set':
         return new Set();
+      case 'blob':
+      case 'file': {
+        integer(node.blob!, 'blob index');
+        const blob = packet.blobs[node.blob!];
+        if (!blob) return failure('Missing blob attachment');
+        if (node.type === 'blob') return blob;
+        if (
+          typeof File === 'undefined' ||
+          typeof node.name !== 'string' ||
+          !Number.isSafeInteger(node.lastModified)
+        )
+          return failure('Invalid or unsupported File');
+        return new File([blob], node.name, {
+          type: blobType(blob),
+          lastModified: node.lastModified,
+        });
+      }
       case 'date':
         return new Date(Number(node.value));
       case 'regexp': {
@@ -325,6 +407,8 @@ export function decodePacket(packet: Packet): unknown {
         for (const item of node.items) (value as Set<unknown>).add(read(item));
       } else return failure('Unexpected collection entries');
     }
+    if ((node.type === 'blob' || node.type === 'file') && (node.props || node.items))
+      return failure('Blob attachments cannot have custom properties');
     if (node.props) {
       if (!Array.isArray(node.props) || (edges += node.props.length) > MAX_EDGES)
         return failure('Invalid properties');

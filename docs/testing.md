@@ -23,7 +23,7 @@
 
 GitHub Actions 配置覆盖 Node.js 22/24 与浏览器；上述是本机结果，本次未核验远端 CI 运行状态。
 
-结构化摘要位于仓库 `docs/results/verification.json`；原始结果不包含在 npm 包中。
+结构化摘要位于仓库 `docs/results/verification.json`；原始结果通过源码仓库提供。
 
 ## 2. 核心资源测试
 
@@ -258,7 +258,7 @@ leases = 0
 × 3 repeats
 ```
 
-每个环境 84 次，合计 168 次。完整矩阵不属于 pnpm verify；修复后的功能回归通过不意味着重新跑过这 168 次计时。
+每个环境 84 次，合计 168 次。完整矩阵通过独立基准命令运行；pnpm verify 执行功能回归。此处 168 次计时对应本节记录的环境与版本。
 
 执行方式：
 
@@ -337,4 +337,4 @@ node examples/node.mjs
 pnpm dev
 ```
 
-Node 示例校验转换结果和最终资源计数；浏览器示例的完成与取消路径由 Playwright 覆盖。`scripts/report.mjs` 只复制原始性能快照并打印摘要，不生成 testing.md、performance.md 或 verification.json；更新快照时应同步核对版本和运行日期。
+Node 示例校验转换结果和最终资源计数；浏览器示例的完成与取消路径由 Playwright 覆盖。`scripts/report.mjs` 复制原始性能快照并打印摘要；testing.md、performance.md 和 verification.json 由维护者同步更新，并核对版本和运行日期。

@@ -1,6 +1,6 @@
 import { validateProgress } from './progress.js';
 import { yieldTask } from './yield.js';
-import { decodePacket, encodePacket, packetBytes } from './packet.js';
+import { decodePacket, encodePacket, packetBytes, validateBlobTransfers } from './packet.js';
 import { ScratchArena } from './resources/scratch.js';
 import { aborted, asError, integer, required, RuntimeError } from './errors.js';
 import {
@@ -139,6 +139,7 @@ export function serve<T extends Catalog<T> = TaskMap>(
         throw new RuntimeError('PROTOCOL_ERROR', 'Malformed task request');
       }
       integer(request.maxOutputBytes, 'maxOutputBytes');
+      integer(request.maxOutputBlobBytes, 'maxOutputBlobBytes');
       scratch = new ScratchArena(request.maxScratchBytes);
       const handler = Object.hasOwn(handlers, request.task)
         ? (handlers as Record<string, TaskHandler<unknown, unknown>>)[request.task]
@@ -172,7 +173,8 @@ export function serve<T extends Catalog<T> = TaskMap>(
       if (!result || !Object.hasOwn(result, 'value')) {
         throw new RuntimeError('PROTOCOL_ERROR', 'Handler must return output(value, transfer)');
       }
-      const value = encodePacket(result.value, request.maxOutputBytes);
+      validateBlobTransfers(result.transfer);
+      const value = encodePacket(result.value, request.maxOutputBytes, request.maxOutputBlobBytes);
       const byteLength = packetBytes(value);
       if (byteLength > request.maxOutputBytes) {
         throw new RuntimeError('BUDGET_EXCEEDED', 'Result exceeds reserved outputBytes');

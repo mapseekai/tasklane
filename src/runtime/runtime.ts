@@ -1,5 +1,11 @@
 import { validateProgress } from '../progress.js';
-import { encodePacket, packetBytes, type Packet } from '../packet.js';
+import {
+  encodePacket,
+  packetBytes,
+  packetBlobBytes,
+  validateBlobTransfers,
+  type Packet,
+} from '../packet.js';
 import { aborted, asError, integer, required, RuntimeError, timeout } from '../errors.js';
 import { type FromWorker, header, isHeader } from '../protocol.js';
 import { BudgetLedger, validateTaskBudget } from '../resources/budget.js';
@@ -317,6 +323,21 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     }
     const budget = validateTaskBudget(raw.budget);
     this.ledger.validate(budget);
+    if (
+      raw.blobLimits !== undefined &&
+      (!raw.blobLimits || typeof raw.blobLimits !== 'object' || Array.isArray(raw.blobLimits))
+    )
+      throw new RuntimeError('INVALID_ARGUMENT', 'blobLimits must be an options object');
+    const blobLimits = {
+      inputBytes: integer(
+        raw.blobLimits === undefined ? 0 : raw.blobLimits.inputBytes,
+        'blobLimits.inputBytes',
+      ),
+      outputBytes: integer(
+        raw.blobLimits === undefined ? 0 : raw.blobLimits.outputBytes,
+        'blobLimits.outputBytes',
+      ),
+    };
     const queueTimeoutMs = timeout(
       raw.queueTimeoutMs ?? this.options.queueTimeoutMs,
       'queueTimeoutMs',
@@ -340,6 +361,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       options: {
         ...raw,
         budget,
+        blobLimits,
         cancellation,
         queueTimeoutMs,
         executionTimeoutMs,
@@ -708,7 +730,12 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       job.controller.signal.throwIfAborted();
       if (slot.state !== 'ready')
         throw new RuntimeError('WORKER_FAILED', 'Worker was lost during input preparation');
-      const payload = encodePacket(prepared.payload, job.options.budget.inputBytes);
+      validateBlobTransfers(prepared.transfer);
+      const payload = encodePacket(
+        prepared.payload,
+        job.options.budget.inputBytes,
+        job.options.blobLimits!.inputBytes,
+      );
       const bytes = packetBytes(payload);
       if (bytes > job.options.budget.inputBytes)
         throw new RuntimeError('BUDGET_EXCEEDED', 'Prepared input exceeds reserved inputBytes');
@@ -726,6 +753,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
           payload,
           maxScratchBytes: job.options.budget.scratchBytes,
           maxOutputBytes: job.options.budget.outputBytes,
+          maxOutputBlobBytes: job.options.blobLimits!.outputBytes,
         },
         prepared.transfer,
       );
@@ -849,6 +877,11 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     if (message.type === 'result') {
       try {
         const bytes = packetBytes(message.value);
+        if (packetBlobBytes(message.value) > job.options.blobLimits!.outputBytes)
+          throw new RuntimeError(
+            'BUDGET_EXCEEDED',
+            'Worker result exceeds logical blob byte limit',
+          );
         if (bytes !== message.byteLength || bytes > job.options.budget.outputBytes)
           throw new RuntimeError(
             'BUDGET_EXCEEDED',

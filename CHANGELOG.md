@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-beta.2 — 2026-09-25
+
+- Protocol v4: bounded Blob/File attachments with preserved File metadata across browser and Node workers.
+- Per-task logical input/output blob limits, separate from packet memory credits; attachments use structured cloning.
+- Tested pull-based file Session example, binary cache guidance and resident Session capacity planning.
+- Capability-focused usage, API and resource documentation.
+
 ## 0.1.0-beta.1 — 2026-09-25
 
 First beta release of tasklane with:

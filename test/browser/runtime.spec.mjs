@@ -4,6 +4,90 @@ test.beforeEach(async ({ page }) => {
   await page.goto('/test/browser/harness.html');
 });
 
+test('File metadata, range reads, logical limits and pull-session cleanup in a real Worker', async ({
+  page,
+}) => {
+  const result = await page.evaluate(async () => {
+    const { createWorkerRuntime, browserWorker, consumeResult } = await import('/dist/index.js');
+    const { readFileChunks } = await import('/examples/file-chunks/read.mjs');
+    const rt = createWorkerRuntime({
+      pools: {
+        cpu: { size: 1, factory: browserWorker('/test/fixtures/browser-worker.mjs') },
+        files: {
+          size: 1,
+          cacheBytes: 128,
+          factory: browserWorker('/examples/file-chunks/worker.mjs'),
+        },
+      },
+    });
+    const file = new File([new Uint8Array(1024 * 1024).fill(42)], '地图.tif', {
+      type: 'image/tiff',
+      lastModified: 123,
+    });
+    const scope = rt.createScope();
+    const options = {
+      pool: 'cpu',
+      budget: { inputBytes: 4096, scratchBytes: 0, outputBytes: 4096 },
+      blobLimits: { inputBytes: file.size, outputBytes: file.size },
+      prepare: () => ({ payload: { file, again: file } }),
+    };
+    try {
+      const metadata = await consumeResult(scope.enqueue('ping', options), async ({ value }) => ({
+        name: value.file.name,
+        type: value.file.type,
+        lastModified: value.file.lastModified,
+        size: value.file.size,
+        alias: value.file === value.again,
+        range: Array.from(new Uint8Array(await value.file.slice(17, 20).arrayBuffer())),
+      }));
+      const errors = [];
+      for (const blobLimits of [undefined, { inputBytes: file.size, outputBytes: 0 }]) {
+        try {
+          await consumeResult(scope.enqueue('ping', { ...options, blobLimits }), () => {});
+        } catch (error) {
+          errors.push(error.code);
+        }
+      }
+      let total = 0;
+      for await (const chunk of readFileChunks(rt, file)) total += chunk.byteLength;
+      for await (const _chunk of readFileChunks(rt, file)) break;
+      const controller = new AbortController();
+      try {
+        for await (const _chunk of readFileChunks(rt, file, { signal: controller.signal }))
+          controller.abort();
+      } catch (error) {
+        errors.push(error.code);
+      }
+      await scope.dispose();
+      return {
+        metadata,
+        errors,
+        total,
+        leases: rt.stats.leases,
+        scopes: rt.stats.scopes,
+        cache: rt.stats.reserved.cacheBytes,
+      };
+    } finally {
+      await rt.dispose();
+    }
+  });
+  expect(result).toEqual({
+    metadata: {
+      name: '地图.tif',
+      type: 'image/tiff',
+      lastModified: 123,
+      size: 1024 * 1024,
+      alias: true,
+      range: [42, 42, 42],
+    },
+    errors: ['BUDGET_EXCEEDED', 'BUDGET_EXCEEDED', 'ABORTED'],
+    total: 1024 * 1024,
+    leases: 0,
+    scopes: 0,
+    cache: 0,
+  });
+});
+
 test('metadata budgets, numeric graph roundtrip, scratch and synchronous preparation', async ({
   page,
 }) => {

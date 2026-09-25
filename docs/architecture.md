@@ -97,7 +97,7 @@ consumer release
 - 结果额度充足
 - 非丢弃任务有可用租约名额
 
-prepare 只执行短小的同步输入构造，异步准备由 Worker handler 完成。队列中的闭包仍可能捕获用户数据，生产者也应采用有限提交窗口。预算约束申报和协议数据，不是 JS 堆上限。
+prepare 只执行短小的同步输入构造，异步准备由 Worker handler 完成。队列中的闭包仍可能捕获用户数据，生产者也应采用有限提交窗口。预算管理申报量和协议数据，实际 JS 堆占用由应用结合运行环境测量。
 
 ## 4. 优先级与公平调度
 
@@ -126,7 +126,7 @@ background
 
 默认采用严格优先级；`priorityPolicy: 'ageing'` 才允许后台随等待时间提升到交互级别，两者均不抢占执行中的任务。
 
-每个优先级/组/Pool 或 Session 通道维护 FIFO 索引堆，准入不复制和排序完整等待队列。空闲组历史有界保留，新组使用当前服务时钟，连续补交任务不会重置公平性。预算不足的等待者达到 `budgetWaitMs` 后，会保护其短缺额度，阻止小任务无限插队。
+每个优先级/组/Pool 或 Session 通道维护 FIFO 索引堆，准入通过索引选择任务。空闲组历史有界保留，新组使用当前服务时钟，连续补交任务沿用服务历史参与公平调度。预算不足的等待者达到 `budgetWaitMs` 后，会保护其短缺额度，阻止小任务无限插队。
 
 ## 5. Worker Slot
 
@@ -199,7 +199,7 @@ cacheBytes
 
 ### 暂存预算
 
-`scratchBytes` 在准入时预留。`ctx.scratch.allocate(bytes)` 提供受限的临时 ArrayBuffer，release 或任务结束会 detach 全部别名。以下直接分配仍由应用估算，Runtime 不会自动监控：
+`scratchBytes` 在准入时预留。`ctx.scratch.allocate(bytes)` 提供受限的临时 ArrayBuffer，release 或任务结束会 detach 全部别名。以下直接分配由应用估算和管理：
 
 - JSON 解析对象
 - WASM heap
@@ -350,7 +350,7 @@ await ctx.cache.delete(key)
 
 普通缓存采用有界 LRU。
 
-`setPinned()` 仅保存可检查的普通数据。数据库、WASM、数据集句柄等不透明实例使用 `setResource(key, value, bytes, disposer)`，声明资源费用并提供异步清理函数。`await cache.delete(key)` 在清理完成后归还额度；失败保留条目，允许重试。硬终止 Worker 无法保证外部资源 disposer 执行。
+`setPinned()` 仅保存可检查的普通数据。数据库、WASM、数据集句柄等不透明实例使用 `setResource(key, value, bytes, disposer)`，声明资源费用并提供异步清理函数。`await cache.delete(key)` 在清理完成后归还额度；失败保留条目，允许重试。硬终止路径的外部资源清理由应用恢复策略负责。
 
 缓存同时控制：
 
@@ -360,7 +360,7 @@ await ctx.cache.delete(key)
 
 ## 13. 协议
 
-协议版本为 3，Runtime 与 Host 必须使用同一版本。消息还携带 Worker epoch：
+协议版本为 4，Runtime 与 Host 必须使用同一版本。消息还携带 Worker epoch：
 
 ```text
 hello
@@ -395,9 +395,9 @@ maxScratchBytes
 
 progress 仅承载 4 KiB 内的小型控制数据，最多单条在途，收到 progress-ack 后才能继续发送；阻塞期间只保存最新快照。任务结束后 context 关闭。
 
-Scope 销毁按 scope/epoch 等待 released 确认，超时或清理失败会拒绝；Session 正常关闭等待 disposer，失败保留 Worker 供重试。物理 terminate 失败保持隔离和额度，通过 `retryTermination()` 重试，不能把逻辑取消当成资源已释放。
+Scope 销毁按 scope/epoch 等待 released 确认，超时或清理失败会拒绝；Session 正常关闭等待 disposer，失败保留 Worker 供重试。物理 terminate 失败保持隔离和额度，通过 `retryTermination()` 重试，资源释放以物理完成确认为准。
 
-自定义 endpoint 必须遵守协议并运行可信代码；原生消息反序列化发生在接收校验之前，因此无法用协议构造进程内存沙箱。
+自定义 endpoint 应运行可信代码，并在发送前遵守协议与额度约束。接收侧先完成原生消息反序列化，再执行协议校验；进程级内存限制由运行环境提供。
 
 ## 14. 可观测性
 

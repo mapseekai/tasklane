@@ -51,6 +51,8 @@ export interface PreparedInput<T> {
 export interface TaskOptions<Input> {
   pool: string;
   budget: TaskBudget;
+  /** Per-packet logical Blob/File sizes; defaults to zero. Not reserved heap/RSS credits. */
+  blobLimits?: { inputBytes: number; outputBytes: number };
   /** Synchronous input construction only. Run asynchronous or expensive preparation inside the Worker. */
   prepare(context: { signal: AbortSignal }): PreparedInput<Input>;
   priority?: Priority;

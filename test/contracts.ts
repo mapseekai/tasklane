@@ -29,6 +29,18 @@ const handlers: TaskHandlers<Tasks> = {
 };
 void handlers;
 
+const files = createWorkerRuntime<{ open: { input: File; output: Blob } }>({
+  pools: { files: { factory, size: 1 } },
+});
+files
+  .createScope()
+  .session('files')
+  .enqueue('open', {
+    budget: { inputBytes: 4096, scratchBytes: 0, outputBytes: 4096 },
+    blobLimits: { inputBytes: 1024, outputBytes: 1024 },
+    prepare: () => ({ payload: new File(['data'], 'input.tif') }),
+  });
+
 binaryByteLength(new Uint8Array(8), { maxObjects: 10, maxEntries: 100 });
 // @ts-expect-error Traversal limits use the structured options API.
 binaryByteLength(new Uint8Array(8), 10);

@@ -66,7 +66,7 @@ test('codec rejects wide arrays before touching entries and never invokes access
 });
 
 test('result receipt only validates wire sizes; decode is lazy and failure releases credits', () => {
-  const packet = { kind: 'graph', metadata: 'invalid json', buffers: [] };
+  const packet = { kind: 'graph', metadata: 'invalid json', buffers: [], blobs: [] };
   assert.equal(packetBytes(packet), 24);
   let released = 0;
   const lease = new OwnedResult(packet, 24, () => released++);

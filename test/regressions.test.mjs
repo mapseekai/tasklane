@@ -409,6 +409,7 @@ test('progress keeps one in flight and only the latest pending snapshot', async 
     payload: { kind: 'scalar', value: null },
     maxScratchBytes: 0,
     maxOutputBytes: 0,
+    maxOutputBlobBytes: 0,
   });
   await until(() => context);
   context.progress(1);

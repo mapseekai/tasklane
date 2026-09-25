@@ -1,7 +1,7 @@
 import type { Packet } from './packet.js';
 import type { ErrorCode } from './errors.js';
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 export const PROTOCOL_TAG = '@mapseekai/tasklane';
 
 export interface Header {
@@ -23,6 +23,7 @@ export type RequestMessage = Header & {
   task: string;
   payload: Packet;
   maxOutputBytes: number;
+  maxOutputBlobBytes: number;
   maxScratchBytes: number;
 };
 export type ToWorker =

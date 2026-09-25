@@ -59,7 +59,7 @@ interface PoolOptions {
 }
 ```
 
-Pool 的 `cacheBytes` 默认 0，`cacheEntries` 默认 4096，`allowHardCancel` 默认 false。`idleTimeoutMs` 默认 30000，设置 0 禁用空闲过期；Session 占用的 Worker 不会因空闲而自动回收。每个存活 Worker 都预留该 Pool 的完整 cacheBytes。
+Pool 的 `cacheBytes` 默认 0，`cacheEntries` 默认 4096，`allowHardCancel` 默认 false。`idleTimeoutMs` 默认 30000，设置 0 禁用空闲过期；Session 持续持有绑定的 Worker，直至关闭或 Worker 失效。每个存活 Worker 都预留该 Pool 的完整 cacheBytes。
 
 适用方式：
 
@@ -162,7 +162,7 @@ const handle = scope.enqueue('project', {
 });
 ```
 
-示例中的 `createPacket()` 应返回最多 8 MiB backing store 和不超过 4096 字节协议元数据的普通包，输出也需满足对应上限；这不是所有对象图通用的固定附加费用。
+示例中的 `createPacket()` 应返回最多 8 MiB backing store 和不超过 4096 字节协议元数据的普通包，输出也需满足对应上限；其他对象图应按实际编码结构确定元数据上限。
 
 ### priority
 
@@ -178,7 +178,7 @@ const handle = scope.enqueue('project', {
 | foreground | 用户主动分析、导入、导出 |
 | background | 预取、缓存构建、后台索引 |
 
-默认任务优先级为 foreground。Runtime 默认 priorityPolicy 为 strict；只有显式设置 ageing 才会跨优先级提升等待任务。两者都不抢占正在执行的任务。
+默认任务优先级为 foreground。Runtime 默认 priorityPolicy 为 strict；只有显式设置 ageing 才会跨优先级提升等待任务。两种策略均在准入时决定执行顺序，已执行任务持续运行至完成或取消。
 
 ### group
 
@@ -262,7 +262,7 @@ const result = await handle.result;
 await handle.settled;
 ```
 
-`settled` 永不拒绝，只表示物理生命周期结束，不代表执行成功，也不会释放普通成功结果。无需结果时设置 `discardResult: true`；需要获知错误仍应观察 `result`。该模式成功时 result 返回已释放租约，不能读取其 value。
+`settled` 在物理生命周期结束后兑现；执行成功或失败由 `result` 表达，成功结果通过 ResultLease 管理。仅等待完成时可设置 `discardResult: true`，并观察 `result` 获知错误；该模式成功时返回已释放租约，访问其 value 会抛出 RESULT_RELEASED。
 
 ### timing
 
@@ -406,14 +406,14 @@ ctx.progress({ completed, total });
 const buffer = ctx.scratch.allocate(1024); // 任务需申报 scratchBytes >= 1024
 try {
   const temporary = new Uint8Array(buffer);
-  // 使用临时工作区；不要让缓存或外部引用依赖它。
+  // 临时工作区随任务释放；跨任务数据应使用独立的常驻存储。
   temporary.fill(0);
 } finally {
   ctx.scratch.release(buffer); // detach 全部 view，归还 arena 内部可用空间
 }
 ```
 
-`ctx.scratch.bytes` 为当前 arena 已分配字节，`limit` 为任务 scratch 额度。任务结束自动关闭 arena；任务级账本的整笔预留直到物理任务结束才释放。普通 JS 分配和 JSON.parse 不受 arena 度量。
+`ctx.scratch.bytes` 为当前 arena 已分配字节，`limit` 为任务 scratch 额度。任务结束自动关闭 arena；任务级账本的整笔预留直到物理任务结束才释放。普通 JS 分配和 JSON.parse 的内存由应用管理。
 
 ### checkpoint
 
@@ -438,7 +438,7 @@ ctx.cache.setPinned(key, value, bytes)
 await ctx.cache.delete(key)
 ```
 
-普通缓存采用 LRU。bytes 不得低于 `dataByteLength(value, { resident: true })`；保存后通过外部引用扩容必须重新申报。
+普通缓存采用 LRU。bytes 至少覆盖 `dataByteLength(value, { resident: true })`；保存后通过外部引用扩容必须重新申报。
 
 典型缓存：
 
@@ -481,7 +481,7 @@ binaryByteLength(value, {
 })
 ```
 
-`binaryByteLength` 只统计二进制 backing store，不能用其返回值申报一般任务预算。
+`binaryByteLength` 统计二进制 backing store；一般任务预算使用包含元数据的 `packetByteLength`。
 
 支持：
 
@@ -504,7 +504,7 @@ packetByteLength({ bytes: new Uint8Array(8) }); // 大于 8，还包含图元数
 dataByteLength('abcd'); // 8，普通缓存的驻留数据计费
 ```
 
-`packetByteLength` 会编码整个值，适合已经存在的小型输入；大型数据应先声明上限，准入后再同步构造。它只有 value 参数，不接受 TraversalLimits。`dataByteLength` 接受与 binaryByteLength 相同的 limits，缓存计算应传 resident: true；计入标量/属性名和每个非二进制对象 16 字节的结构费用。任何一个计数都不代表真实 JS 堆占用。
+`packetByteLength` 会编码整个值，适合已经存在的小型输入；大型数据应先声明上限，准入后再同步构造。其参数为 value。`dataByteLength` 接受与 binaryByteLength 相同的 limits，缓存计算应传 resident: true；计入标量/属性名和每个非二进制对象 16 字节的结构费用。这些计数用于确定资源申报量，真实 JS 堆占用需结合运行环境测量。
 
 结果在首次读取 `lease.value` 时解码，`lease.byteLength` 是传输计费量。
 
@@ -564,9 +564,22 @@ observerErrors
 ```ts
 runtime.resourceDiagnostics(); // 定位持有任务、租约和 Session 的所有者
 await runtime.retryTermination(); // 重试物理终止失败的隔离 Worker
-await runtime.disposeWithin(5000); // 限制等待时间；拒绝并不意味着清理已完成
+await runtime.disposeWithin(5000); // 限制等待时间；超时后后台清理继续进行
 ```
 
-`scope.disposeWithin(ms)` 同样只约束等待时间，Session 使用 dispose。协议 v3 的 request 携带 Packet payload、maxOutputBytes 和 maxScratchBytes；progress 使用 ACK，Scope 释放也需要 ACK。
+`scope.disposeWithin(ms)` 同样只约束等待时间，Session 使用 dispose。协议 v4 的 request 携带 Packet payload、maxOutputBytes、maxOutputBlobBytes 和 maxScratchBytes；progress 使用 ACK，Scope 释放也需要 ACK。
 
-详见 [资源与调度契约](resources.md)，包括元数据限制、`budgetWaitMs`、`releaseTimeoutMs`、进度 ACK、Scope 释放确认、`withScope`、`disposeWithin`、`resourceDiagnostics` 和 `retryTermination`。Runtime 与 host 必须使用匹配的协议版本。
+详见 [资源与调度契约](resources.md)，包括元数据限制、`budgetWaitMs`、`releaseTimeoutMs`、进度 ACK、Scope 释放确认、`withScope`、`disposeWithin`、`resourceDiagnostics` 和 `retryTermination`。
+
+### TaskOptions.blobLimits
+
+```ts
+scope.enqueue('open', {
+  pool: 'reader',
+  budget: { inputBytes: 4096, scratchBytes: 0, outputBytes: 0 },
+  blobLimits: { inputBytes: file.size, outputBytes: 0 },
+  prepare: () => ({ payload: file }),
+});
+```
+
+可选 `{ inputBytes: number; outputBytes: number }`，省略时均为 0；提供对象时两项都必填。限制每包 File/Blob 逻辑大小，重复对象仅计一次，与全局 inputBytes/outputBytes 额度独立。4096 只是此短文件名示例的元数据上限，超长文件名需要更高预算。`packetByteLength(file)` 返回引用与元数据费用，file.size 由 blobLimits 单独校验。Scope 与 Session 任务均支持，附件通过克隆传递。语义及限制见 [资源契约](resources.md#fileblob-附件)。

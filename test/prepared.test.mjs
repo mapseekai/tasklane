@@ -68,6 +68,7 @@ test('asynchronous production reserves the whole envelope before allocation and 
           scratchBytes: 16,
           outputBytes: 8,
           cacheBytes: 0,
+          residentBytes: 0,
         });
         assert.equal(rt.stats.workers, 0);
         await g.promise;

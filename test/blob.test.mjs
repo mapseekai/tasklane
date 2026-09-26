@@ -194,7 +194,8 @@ test('large numerical cache stores the complete backing buffer and recreates vie
   const values = new Float32Array(1_000_001);
   values[1_000_000] = 42;
   const cache = new CacheStore(values.byteLength).scope('numerical');
-  assert.throws(() => cache.set('view', values, values.byteLength), { code: 'BUDGET_EXCEEDED' });
+  cache.set('view', values, values.byteLength);
+  assert.equal(cache.get('view')[1_000_000], 42);
   cache.set('buffer', values.buffer, values.byteLength);
   assert.equal(new Float32Array(cache.get('buffer'))[1_000_000], 42);
 });

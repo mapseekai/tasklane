@@ -7,11 +7,44 @@ import {
   validateBlobTransfers,
   type Packet,
 } from '../packet.js';
-import { aborted, asError, integer, required, RuntimeError, timeout } from '../errors.js';
+import {
+  aborted,
+  asError,
+  integer,
+  required,
+  RuntimeError,
+  SessionAdmissionError,
+  timeout,
+} from '../errors.js';
 import { type FromWorker, header, isHeader } from '../protocol.js';
 import { BudgetLedger, validateTaskBudget } from '../resources/budget.js';
 import { OwnedResult } from '../resources/lease.js';
+import { ResidentLease } from '../resources/resident.js';
+import {
+  addCacheStats,
+  cacheReport,
+  emptyCacheStats,
+  emptyReclaimStats,
+} from '../resources/telemetry.js';
 import type {
+  AdaptivePoolOptions,
+  InteractiveReserve,
+  MaintenanceReport,
+  MemoryPressure,
+  PoolSizing,
+  TrimOptions,
+  ReclaimReason,
+  ReclaimStats,
+  ResourceCacheSnapshot,
+  Priority,
+  CacheStats,
+  AdmissionBlocker,
+  RuntimeDiagnostics,
+  SessionAdmissionOptions,
+  SessionOptions,
+  ResourceOptions,
+  ResourceLease,
+  ResourceReservations,
   Catalog,
   PoolOptions,
   PreparedInput,
@@ -36,8 +69,16 @@ import { Scheduler } from './scheduler.js';
 
 type Timer = ReturnType<typeof setTimeout>;
 interface Pool {
-  options: Required<PoolOptions>;
+  options: Required<Omit<PoolOptions, 'adaptive'>> & { adaptive?: Required<AdaptivePoolOptions> };
+  capacity: number;
+  cacheTarget: number;
+  resourceCacheStats: CacheStats;
+  reclaim: ReclaimStats;
+  lastDemand: number;
+  lastSample: CacheStats;
+  lastSampleAt: number;
   slots: Set<Slot>;
+  cacheStats: CacheStats;
 }
 interface Slot {
   epoch: number;
@@ -57,6 +98,20 @@ interface Slot {
   releaseCache(): void;
   used: number;
   cacheUsed: number;
+  cacheStats: CacheStats;
+  resourceCacheStats: CacheStats;
+  reports: ResourceCacheSnapshot[];
+  cacheLimit: number;
+  deferredCacheResize?: boolean;
+  priority: Priority;
+  control?: {
+    id: string;
+    target: number;
+    extra?: () => void;
+    result: Deferred<void>;
+    timer?: Timer;
+  };
+  reclaim?: Promise<void>;
 }
 interface ScopeRecord {
   id: string;
@@ -67,10 +122,12 @@ interface ScopeRecord {
   jobs: Set<Job>;
   sessions: Set<SessionRecord>;
   leases: Set<OwnedResult<unknown>>;
+  resources: Set<ResourceLease>;
   touched: Set<Slot>;
   disposal?: Promise<void>;
 }
 interface SessionRecord {
+  priority: Priority;
   id: string;
   scope: ScopeRecord;
   pool: string;
@@ -78,13 +135,32 @@ interface SessionRecord {
   closed: boolean;
   lost?: RuntimeError;
   leases: Set<OwnedResult<unknown>>;
+  resources: Set<ResourceLease>;
+  resident?: ResourceLease;
+  /** Disposal must await a factory that may synchronously cancel its own admission. */
+  binding?: Promise<void>;
   disposal?: Promise<void>;
+  reclaimable: boolean;
+  reclaimPriority: number;
+  reclaimed: boolean;
+  delivering: boolean;
+}
+interface SessionRequest<T extends Catalog<T>> {
+  session: SessionRecord;
+  result: Deferred<WorkerSession<T>>;
+  mode: 'immediate' | 'wait';
+  residentBytes?: number;
+  timer?: Timer;
+  removeSignal?: () => void;
 }
 interface Job {
+  candidates?: readonly SessionRecord[];
+  admissionTimer?: Timer;
   id: string;
   order: number;
   groupKey: string;
   laneKey: string;
+  affinityKeys: readonly string[];
   phase: 'queue' | 'produce' | 'prepared' | 'startup' | 'prepare' | 'execute' | 'done';
   name: string;
   scope: ScopeRecord;
@@ -123,12 +199,27 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
   private readonly scopes = new Set<ScopeRecord>();
   private readonly jobs = new Map<string, Job>();
   private readonly queue = new Set<Job>();
+  private readonly acquisitions = new Map<SessionRecord, SessionRequest<T>>();
   private readonly ledger: BudgetLedger;
-  private readonly affinity = new Map<string, Slot>();
+  private readonly affinity = new Map<string, Set<Slot>>();
+  private readonly resourceLeases = new Set<ResourceLease>();
+  readonly resources: ResourceReservations = {
+    acquire: (options) => this._acquireResource(options),
+  };
   private readonly scheduler: Scheduler<Job>;
   private reservation?: Job;
   private reclaiming = false;
-  private readonly options: Required<Omit<RuntimeOptions, 'pools' | 'budgets' | 'onDiagnostic'>>;
+  private readonly options: Required<
+    Omit<RuntimeOptions, 'pools' | 'budgets' | 'onDiagnostic' | 'interactiveReserve'>
+  >;
+  private readonly interactive: Required<Omit<InteractiveReserve, 'budgets'>>;
+  private nonInteractiveActive = 0;
+  private nonInteractiveResults = 0;
+  private memoryPressure: MemoryPressure = 'normal';
+  private maintenance?: Promise<MaintenanceReport>;
+  private adaptiveTimer?: Timer;
+  private schedulerTimer?: Timer;
+  private pressureTargets = new Map<Pool, Required<PoolSizing>>();
   private readonly diagnostic?: RuntimeOptions['onDiagnostic'];
   private readonly prefix = `runtime-${++runtimeSerial}`;
   private serial = 0;
@@ -150,6 +241,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     inputBytes: 0,
     outputBytes: 0,
     observerErrors: 0,
+    sessionsReclaimed: 0,
   };
 
   constructor(options: RuntimeOptions) {
@@ -170,18 +262,58 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
         );
       }
       const size = integer(pool.size, `${name}.size`, 1);
+      const cacheBytes = integer(pool.cacheBytes ?? 0, `${name}.cacheBytes`);
+      const interactiveWorkers = integer(pool.interactiveWorkers ?? 0, 'interactiveWorkers');
+      if (interactiveWorkers > size)
+        throw new RuntimeError('INVALID_ARGUMENT', 'Interactive Worker reserve exceeds pool size');
+      const adaptive = pool.adaptive
+        ? {
+            minWorkers: integer(
+              pool.adaptive.minWorkers ?? Math.max(1, interactiveWorkers),
+              'minWorkers',
+              1,
+            ),
+            minCacheBytes: integer(
+              pool.adaptive.minCacheBytes ?? Math.floor(cacheBytes / 4),
+              'minCacheBytes',
+            ),
+            sampleMs: timeout(pool.adaptive.sampleMs ?? 1000, 'adaptive sampleMs'),
+            idleMs: timeout(pool.adaptive.idleMs ?? 30_000, 'adaptive idleMs'),
+            missRatio: pool.adaptive.missRatio ?? 0.2,
+          }
+        : undefined;
+      if (
+        adaptive &&
+        (adaptive.minWorkers > size ||
+          adaptive.minWorkers < interactiveWorkers ||
+          adaptive.minCacheBytes > cacheBytes ||
+          !Number.isFinite(adaptive.missRatio) ||
+          adaptive.missRatio < 0 ||
+          adaptive.missRatio > 1)
+      )
+        throw new RuntimeError('INVALID_ARGUMENT', 'Invalid adaptive pool bounds');
       capacity += size;
       this.pools.set(name, {
         options: {
           ...pool,
+          adaptive,
           size,
-          cacheBytes: integer(pool.cacheBytes ?? 0, `${name}.cacheBytes`),
+          interactiveWorkers,
+          cacheBytes,
           cacheEntries: integer(pool.cacheEntries ?? 4096, `${name}.cacheEntries`, 1),
           allowHardCancel: pool.allowHardCancel ?? false,
           idleTimeoutMs:
             pool.idleTimeoutMs === 0 ? 0 : timeout(pool.idleTimeoutMs ?? 30_000, 'idleTimeoutMs'),
         },
         slots: new Set(),
+        capacity: adaptive?.minWorkers ?? size,
+        cacheTarget: adaptive?.minCacheBytes ?? cacheBytes,
+        lastDemand: performance.now(),
+        lastSample: emptyCacheStats(),
+        lastSampleAt: performance.now(),
+        resourceCacheStats: emptyCacheStats(),
+        reclaim: emptyReclaimStats(),
+        cacheStats: { hits: 0, misses: 0, evictions: 0 },
       });
     }
     this.options = {
@@ -195,6 +327,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       maxPreparingTasks: integer(options.maxPreparingTasks ?? 2, 'maxPreparingTasks', 1),
       maxQueuedTasks: integer(options.maxQueuedTasks ?? 1024, 'maxQueuedTasks', 1),
       maxResultLeases: integer(options.maxResultLeases ?? 1024, 'maxResultLeases', 1),
+      maxResourceLeases: integer(options.maxResourceLeases ?? 4096, 'maxResourceLeases', 1),
       maxScopes: integer(options.maxScopes ?? 4096, 'maxScopes', 1),
       startupTimeoutMs: timeout(options.startupTimeoutMs ?? 10_000, 'startupTimeoutMs'),
       queueTimeoutMs: timeout(options.queueTimeoutMs ?? 120_000, 'queueTimeoutMs'),
@@ -209,13 +342,29 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       scratchBytes: options.budgets?.scratchBytes ?? 128 * MiB,
       outputBytes: options.budgets?.outputBytes ?? 64 * MiB,
       cacheBytes: options.budgets?.cacheBytes ?? 128 * MiB,
+      residentBytes: options.budgets?.residentBytes ?? 128 * MiB,
     };
-    this.ledger = new BudgetLedger(budgets);
+    const reserve = options.interactiveReserve ?? {};
+    this.interactive = {
+      workers: integer(reserve.workers ?? 0, 'interactive workers'),
+      activeTasks: integer(reserve.activeTasks ?? 0, 'interactive activeTasks'),
+      preparingTasks: integer(reserve.preparingTasks ?? 0, 'interactive preparingTasks'),
+      resultLeases: integer(reserve.resultLeases ?? 0, 'interactive resultLeases'),
+    };
+    if (
+      this.interactive.workers > this.options.maxWorkers ||
+      this.interactive.activeTasks > this.options.maxActiveTasks ||
+      this.interactive.preparingTasks > this.options.maxPreparingTasks ||
+      this.interactive.resultLeases > this.options.maxResultLeases
+    )
+      throw new RuntimeError('INVALID_ARGUMENT', 'Interactive reserve exceeds runtime capacity');
+    this.ledger = new BudgetLedger(budgets, reserve.budgets);
     this.scheduler = new Scheduler(this.options.ageingMs, 4096, options.priorityPolicy ?? 'strict');
     for (const pool of this.pools.values()) {
       this.ledger.validate({ cacheBytes: pool.options.cacheBytes });
     }
     this.diagnostic = options.onDiagnostic;
+    this.armAdaptive();
   }
 
   get stats(): RuntimeStats {
@@ -225,6 +374,20 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       for (const key of ['inputBytes', 'scratchBytes', 'outputBytes'] as const)
         preparationReserved[key] += job.cost[key];
     return {
+      resourceCacheStats: [...this.pools.values()].reduce((sum, p) => {
+        addCacheStats(sum, p.resourceCacheStats);
+        return sum;
+      }, emptyCacheStats()),
+      reclaim: this.reclaimStats(),
+      scheduler: this.scheduler.stats,
+      cacheStats: [...this.pools.values()].reduce(
+        (sum, pool) => ({
+          hits: Math.min(Number.MAX_SAFE_INTEGER, sum.hits + pool.cacheStats.hits),
+          misses: Math.min(Number.MAX_SAFE_INTEGER, sum.misses + pool.cacheStats.misses),
+          evictions: Math.min(Number.MAX_SAFE_INTEGER, sum.evictions + pool.cacheStats.evictions),
+        }),
+        { hits: 0, misses: 0, evictions: 0 },
+      ),
       queued: this.queue.size,
       active: this.active,
       preparing: [...this.preparationWindow].filter((job) => job.phase === 'produce').length,
@@ -233,6 +396,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       workers: slots.length,
       closingWorkers: slots.filter((slot) => slot.state === 'closing').length,
       leases: this.leaseCount,
+      resourceLeases: this.resourceLeases.size,
       scopes: this.scopes.size,
       quarantinedWorkers: slots.filter((slot) => slot.terminationFailed).length,
       reserved: { ...this.ledger.used },
@@ -241,15 +405,538 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       ...this.counters,
     };
   }
+  private priority(value?: Priority): Priority {
+    if (value !== undefined && !Object.hasOwn(priorities, value))
+      throw new RuntimeError('INVALID_ARGUMENT', 'Unknown admission priority');
+    return value ?? 'foreground';
+  }
+  private slotClass(slot: Slot, priority: Priority): boolean {
+    return (
+      priority === 'interactive' ||
+      slot.priority !== 'interactive' ||
+      !(
+        this.interactive.workers ||
+        slot.pool.options.interactiveWorkers ||
+        this.ledger.protected.cacheBytes
+      )
+    );
+  }
+  private canSpawn(pool: Pool, priority: Priority): boolean {
+    const slots = this.slots();
+    return (
+      pool.slots.size < pool.capacity &&
+      slots.length < this.options.maxWorkers &&
+      this.ledger.fits({ cacheBytes: pool.cacheTarget }, priority) &&
+      (priority === 'interactive' ||
+        (slots.filter((s) => s.priority !== 'interactive').length <
+          this.options.maxWorkers - this.interactive.workers &&
+          [...pool.slots].filter((s) => s.priority !== 'interactive').length <
+            pool.capacity - pool.options.interactiveWorkers))
+    );
+  }
+  private classBlocked(pool: Pool, priority: Priority): boolean {
+    if (priority === 'interactive') return false;
+    return (
+      (!!this.interactive.workers &&
+        this.slots().filter((s) => s.priority !== 'interactive').length >=
+          this.options.maxWorkers - this.interactive.workers) ||
+      (!!pool.options.interactiveWorkers &&
+        [...pool.slots].filter((s) => s.priority !== 'interactive').length >=
+          pool.capacity - pool.options.interactiveWorkers) ||
+      (!this.ledger.fits({ cacheBytes: pool.cacheTarget }, priority) &&
+        this.ledger.fits({ cacheBytes: pool.cacheTarget }))
+    );
+  }
+  private reclaimStats(): ReclaimStats {
+    const sum = emptyReclaimStats();
+    for (const { reclaim: r } of this.pools.values()) {
+      sum.attempts += r.attempts;
+      sum.succeeded += r.succeeded;
+      sum.failed += r.failed;
+      for (const reason of Object.keys(sum.byReason) as ReclaimReason[])
+        sum.byReason[reason] += r.byReason[reason];
+    }
+    return sum;
+  }
+  /** Change admission targets within configured hard bounds; busy and required Sessions are retained. */
+  resizePool(name: string, sizing: PoolSizing): Promise<MaintenanceReport> {
+    return this.runMaintenance(async () => {
+      const pool = this.pools.get(name);
+      if (!pool) throw new RuntimeError('INVALID_ARGUMENT', `Unknown pool: ${name}`);
+      return this.adjustPool(pool, sizing, 'resize', true);
+    });
+  }
+  /** Application-driven pressure signal; normal restores the targets saved before pressure. */
+  setMemoryPressure(level: MemoryPressure): Promise<MaintenanceReport> {
+    return this.runMaintenance(async () => {
+      if (!['normal', 'moderate', 'critical'].includes(level))
+        throw new RuntimeError('INVALID_ARGUMENT', 'Unknown memory pressure level');
+      this.memoryPressure = level;
+      const reports: MaintenanceReport[] = [];
+      for (const pool of this.pools.values()) {
+        if (level === 'normal') {
+          const target = this.pressureTargets.get(pool);
+          if (target) reports.push(await this.adjustPool(pool, target, 'pressure', true));
+        } else {
+          if (!this.pressureTargets.has(pool))
+            this.pressureTargets.set(pool, { size: pool.capacity, cacheBytes: pool.cacheTarget });
+          const base = this.pressureTargets.get(pool)!;
+          reports.push(
+            await this.adjustPool(
+              pool,
+              {
+                size: Math.max(
+                  1,
+                  pool.options.interactiveWorkers,
+                  level === 'critical' ? 1 : Math.ceil(base.size / 2),
+                ),
+                cacheBytes: level === 'critical' ? 0 : Math.floor(base.cacheBytes / 2),
+              },
+              'pressure',
+              true,
+              level === 'critical' ? 0 : undefined,
+            ),
+          );
+        }
+      }
+      if (level === 'normal') this.pressureTargets.clear();
+      return this.combineReports(reports);
+    });
+  }
+  trim(options: TrimOptions = {}): Promise<MaintenanceReport> {
+    return this.runMaintenance(async () => {
+      if (
+        !options ||
+        (options.reclaimSessions !== undefined && typeof options.reclaimSessions !== 'boolean')
+      )
+        throw new RuntimeError('INVALID_ARGUMENT', 'Invalid trim options');
+      const pools = options.pool ? [this.pools.get(options.pool)] : [...this.pools.values()];
+      if (pools.some((p) => !p)) throw new RuntimeError('INVALID_ARGUMENT', 'Unknown trim pool');
+      const workers = integer(options.workersPerPool ?? 0, 'trim workers');
+      const reports: MaintenanceReport[] = [];
+      for (const pool of pools as Pool[])
+        reports.push(
+          await this.adjustPool(
+            pool,
+            {
+              size: Math.max(1, pool.options.interactiveWorkers, Math.min(pool.capacity, workers)),
+              cacheBytes: options.cacheBytesPerWorker ?? 0,
+            },
+            'pressure',
+            options.reclaimSessions ?? true,
+            workers,
+          ),
+        );
+      return this.combineReports(reports);
+    });
+  }
+  private combineReports(reports: MaintenanceReport[]): MaintenanceReport {
+    return {
+      workersReclaimed: reports.reduce((n, r) => n + r.workersReclaimed, 0),
+      cacheBytesReleased: reports.reduce((n, r) => n + r.cacheBytesReleased, 0),
+      failures: reports.flatMap((r) => [...r.failures]),
+    };
+  }
+  private runMaintenance(work: () => Promise<MaintenanceReport>): Promise<MaintenanceReport> {
+    if (this.closed) return Promise.reject(new RuntimeError('CLOSED', 'Runtime is closed'));
+    if (this.maintenance)
+      return Promise.reject(
+        new RuntimeError('INVALID_ARGUMENT', 'Await the preceding maintenance operation'),
+      );
+    const result = Promise.resolve()
+      .then(work)
+      .finally(() => {
+        this.maintenance = undefined;
+        this.schedule('workers', 'cache-budget');
+      });
+    this.maintenance = result;
+    return result;
+  }
+  private async adjustPool(
+    pool: Pool,
+    sizing: PoolSizing,
+    reason: ReclaimReason,
+    sessions: boolean,
+    liveTarget?: number,
+  ): Promise<MaintenanceReport> {
+    const size = integer(sizing.size ?? pool.capacity, 'pool size', 1);
+    const cacheBytes = integer(sizing.cacheBytes ?? pool.cacheTarget, 'pool cacheBytes');
+    if (
+      size > pool.options.size ||
+      size < pool.options.interactiveWorkers ||
+      cacheBytes > pool.options.cacheBytes
+    )
+      throw new RuntimeError('INVALID_ARGUMENT', 'Pool targets exceed configured bounds');
+    pool.capacity = size;
+    pool.cacheTarget = cacheBytes;
+    this.schedule(this.poolKey(pool), 'workers', 'cache-budget');
+    const failures: { pool: string; worker: number; message: string }[] = [];
+    let workersReclaimed = 0;
+    const before = [...pool.slots].reduce((n, s) => n + s.cacheLimit, 0);
+    const name = [...this.pools].find(([, value]) => value === pool)![0];
+    const eligible = (slot: Slot) =>
+      (this.available(slot) && slot.state === 'ready') ||
+      (sessions && this.reclaimableSession(slot));
+    const victims = [...pool.slots]
+      .filter(eligible)
+      .sort(
+        (a, b) =>
+          Number(!!a.session) - Number(!!b.session) ||
+          (a.session?.reclaimPriority ?? 0) - (b.session?.reclaimPriority ?? 0) ||
+          a.used - b.used,
+      );
+    for (const slot of victims) {
+      if (this.closed || pool.slots.size <= (liveTarget ?? size)) break;
+      // Earlier cleanup may have yielded while another candidate received work or a lease.
+      if (!eligible(slot)) continue;
+      try {
+        await this.reclaimSlot(slot, reason);
+        workersReclaimed++;
+      } catch (error) {
+        failures.push({ pool: name, worker: slot.epoch, message: asError(error).message });
+      }
+    }
+    for (const slot of [...pool.slots]) {
+      if (this.closed) break;
+      if (slot.state === 'closed' || slot.state === 'closing') continue;
+      if (reason === 'adaptive' && (slot.job || slot.state === 'starting')) {
+        slot.deferredCacheResize = slot.cacheLimit !== cacheBytes;
+        continue;
+      }
+      slot.deferredCacheResize = false;
+      try {
+        await this.resizeCache(slot, cacheBytes, cacheBytes < slot.cacheLimit);
+      } catch (error) {
+        failures.push({ pool: name, worker: slot.epoch, message: asError(error).message });
+      }
+    }
+    this.schedule(`pool:${name}`, 'workers', 'cache-budget');
+    const after = [...pool.slots].reduce((n, s) => n + s.cacheLimit, 0);
+    return { workersReclaimed, cacheBytesReleased: Math.max(0, before - after), failures };
+  }
+  private async resizeCache(slot: Slot, limit: number, trim: boolean): Promise<void> {
+    await slot.ready.promise;
+    if (slot.state !== 'ready' || this.closed)
+      throw new RuntimeError('CLOSED', 'Worker is closing');
+    if (slot.control) return slot.control.result.promise;
+    if (limit === slot.cacheLimit && !trim) return;
+    const extra =
+      limit > slot.cacheLimit
+        ? this.ledger.reserve({ cacheBytes: limit - slot.cacheLimit }, slot.priority)
+        : undefined;
+    const id = `cache-${++this.serial}`,
+      result = deferred<void>();
+    const control: NonNullable<Slot['control']> = { id, target: limit, extra, result };
+    slot.control = control;
+    clearTimeout(slot.idleTimer);
+    // The acknowledgement deadline covers cleanup, not a preceding business task.
+    // Mark the Slot first so subsequent jobs cannot race the quiescent boundary.
+    const running = slot.job;
+    void (async () => {
+      if (running) await running.settled.promise;
+      if (slot.control !== control || slot.state !== 'ready') return;
+      control.timer = setTimeout(() => {
+        void this.retire(
+          slot,
+          new RuntimeError('EXECUTION_TIMEOUT', 'Cache control acknowledgement timed out'),
+        );
+      }, this.options.releaseTimeoutMs);
+      slot.endpoint.postMessage({ ...header(slot.epoch), type: 'cache-control', id, limit, trim });
+    })().catch((error) => {
+      void this.retire(slot, asError(error));
+    });
+    return result.promise;
+  }
+  private armAdaptive(): void {
+    const pools = [...this.pools.values()].filter((p) => p.options.adaptive);
+    if (this.closed || !pools.length) return;
+    this.adaptiveTimer = setTimeout(
+      () => {
+        void (async () => {
+          if (this.memoryPressure !== 'normal' || this.maintenance) return;
+          await this.runMaintenance(async () => {
+            const reports: Promise<MaintenanceReport>[] = [];
+            for (const pool of pools) {
+              const config = pool.options.adaptive!,
+                now = performance.now();
+              if (now - pool.lastSampleAt < config.sampleMs) continue;
+              pool.lastSampleAt = now;
+              const name = [...this.pools].find(([, p]) => p === pool)![0];
+              const queued =
+                [...this.queue].filter((j) => j.options.pool === name).length +
+                [...this.acquisitions.keys()].filter((s) => s.pool === name && !s.slot).length;
+              if (queued || [...pool.slots].some((s) => s.job)) pool.lastDemand = now;
+              const totals = { ...pool.cacheStats };
+              addCacheStats(totals, pool.resourceCacheStats);
+              const misses = totals.misses - pool.lastSample.misses,
+                hits = totals.hits - pool.lastSample.hits;
+              const evictions = totals.evictions - pool.lastSample.evictions;
+              pool.lastSample = totals;
+              const idle = now - pool.lastDemand >= config.idleMs;
+              const size = idle
+                ? config.minWorkers
+                : Math.min(pool.options.size, pool.capacity + Number(queued > 0));
+              const cacheBytes = idle
+                ? config.minCacheBytes
+                : misses > 0 &&
+                    (evictions > 0 || [...pool.slots].some((s) => s.cacheUsed >= s.cacheLimit)) &&
+                    misses / Math.max(1, hits + misses) >= config.missRatio
+                  ? Math.min(
+                      pool.options.cacheBytes,
+                      Math.max(pool.cacheTarget + 1, Math.ceil(pool.cacheTarget * 1.5)),
+                    )
+                  : pool.cacheTarget;
+              const reconcile = [...pool.slots].some(
+                (slot) =>
+                  (slot.deferredCacheResize &&
+                    slot.state === 'ready' &&
+                    !slot.job &&
+                    !slot.control &&
+                    !slot.releases.size) ||
+                  (pool.slots.size > size &&
+                    ((this.available(slot) && slot.state === 'ready') ||
+                      this.reclaimableSession(slot))),
+              );
+              if (size !== pool.capacity || cacheBytes !== pool.cacheTarget || reconcile)
+                reports.push(this.adjustPool(pool, { size, cacheBytes }, 'adaptive', true));
+            }
+            const report = this.combineReports(await Promise.all(reports));
+            for (const failure of report.failures)
+              this.observe(
+                new RuntimeError(
+                  'WORKER_FAILED',
+                  `Adaptive maintenance failed in ${failure.pool}: ${failure.message}`,
+                ),
+              );
+            return report;
+          });
+        })()
+          .catch((error) =>
+            this.observe(
+              new RuntimeError('WORKER_FAILED', 'Adaptive maintenance failed', { cause: error }),
+            ),
+          )
+          .finally(() => this.armAdaptive());
+      },
+      Math.min(...pools.map((p) => p.options.adaptive!.sampleMs)),
+    );
+  }
+
+  /** Independent read-only snapshots; reading diagnostics never admits work. */
+  diagnostics(): RuntimeDiagnostics {
+    const waiting: RuntimeDiagnostics['waiting'][number][] = [];
+    for (const job of this.queue)
+      waiting.push({
+        id: job.id,
+        pool: job.options.pool,
+        session: job.session?.id,
+        kind: 'task',
+        reasons: this.taskBlockers(job),
+      });
+    for (const { session } of this.acquisitions.values())
+      waiting.push({
+        id: session.id,
+        pool: session.pool,
+        session: session.id,
+        kind: 'session',
+        reasons: this.sessionBlockers(session),
+      });
+    return {
+      memoryPressure: this.memoryPressure,
+      limits: {
+        ...this.ledger.limits,
+        maxWorkers: this.options.maxWorkers,
+        maxActiveTasks: this.options.maxActiveTasks,
+        maxPreparingTasks: this.options.maxPreparingTasks,
+        maxResultLeases: this.options.maxResultLeases,
+        maxQueuedTasks: this.options.maxQueuedTasks,
+        maxResourceLeases: this.options.maxResourceLeases,
+      },
+      pools: [...this.pools].map(([name, pool]) => {
+        const slots = [...pool.slots];
+        return {
+          name,
+          cacheStats: { ...pool.cacheStats },
+          resourceCacheStats: { ...pool.resourceCacheStats },
+          resources: slots.flatMap((s) => s.reports.map((r) => ({ ...r, keys: [...r.keys] }))),
+          reclaim: { ...pool.reclaim, byReason: { ...pool.reclaim.byReason } },
+          maxCapacity: pool.options.size,
+          maxCacheBytesPerWorker: pool.options.cacheBytes,
+          adaptive: !!pool.options.adaptive,
+          capacity: pool.capacity,
+          workers: slots.length,
+          starting: slots.filter((s) => s.state === 'starting').length,
+          running: slots.filter((s) => s.state === 'ready' && s.job).length,
+          idle: slots.filter((s) => this.available(s) && s.state === 'ready').length,
+          sessionIdle: slots.filter((s) => s.state === 'ready' && s.session && !s.job).length,
+          closing: slots.filter((s) => s.state === 'closing').length,
+          quarantined: slots.filter((s) => s.terminationFailed).length,
+          boundSessions: slots.filter((s) => s.session).length,
+          reclaimableSessions: slots.filter((s) => this.reclaimableSession(s)).length,
+          waitingSessions: [...this.acquisitions.keys()].filter((session) => session.pool === name)
+            .length,
+          queuedTasks: [...this.queue].filter((job) => job.options.pool === name).length,
+          cacheBytesPerWorker: pool.cacheTarget,
+          cacheReservedBytes: slots.reduce(
+            (n, s) => n + s.cacheLimit + Math.max(0, (s.control?.target ?? 0) - s.cacheLimit),
+            0,
+          ),
+          cacheUsedBytes: slots.reduce((sum, slot) => sum + slot.cacheUsed, 0),
+          blockers: this.poolBlockers(pool),
+        };
+      }),
+      waiting,
+    };
+  }
+  private poolBlockers(pool: Pool, priority: Priority = 'interactive'): AdmissionBlocker[] {
+    if ([...pool.slots].some((s) => this.available(s) && this.slotClass(s, priority))) return [];
+    const reasons: AdmissionBlocker[] = [];
+    if (this.classBlocked(pool, priority)) reasons.push('interactive-reserve');
+    if ([...pool.slots].some((s) => s.control)) reasons.push('maintenance');
+    if (pool.slots.size >= pool.capacity) reasons.push('pool-capacity');
+    if (this.slots().length >= this.options.maxWorkers) reasons.push('worker-capacity');
+    if (!this.ledger.fits({ cacheBytes: pool.cacheTarget }, priority)) reasons.push('cache-budget');
+    if (reasons.length) {
+      if ([...pool.slots].some((s) => s.state === 'closing')) reasons.push('worker-closing');
+      if ([...pool.slots].some((s) => s.session)) reasons.push('session-busy');
+      if ([...pool.slots].some((s) => s.releases.size)) reasons.push('scope-release');
+    }
+    return reasons;
+  }
+  private waitingPrimary(pool: string): boolean {
+    return [...this.acquisitions.keys()].some(
+      (session) => session.pool === pool && !session.reclaimable && !session.slot,
+    );
+  }
+  private sessionBlockers(session: SessionRecord): AdmissionBlocker[] {
+    if (session.slot) return ['session-starting'];
+    if (session.reclaimable && this.waitingPrimary(session.pool)) return ['session-priority'];
+    const reasons = this.poolBlockers(this.pools.get(session.pool)!, session.priority);
+    const bytes = this.acquisitions.get(session)?.residentBytes;
+    if (bytes !== undefined) {
+      if (!this.ledger.fits({ residentBytes: bytes }, session.priority)) {
+        reasons.push('resident-budget');
+        if (this.ledger.fits({ residentBytes: bytes }) && !reasons.includes('interactive-reserve'))
+          reasons.push('interactive-reserve');
+      }
+      if (this.resourceLeases.size >= this.options.maxResourceLeases)
+        reasons.push('resource-leases');
+    }
+    return reasons;
+  }
+  private protectedBudget(candidate: Job): boolean {
+    const reserved = this.reservation;
+    return (
+      !!reserved &&
+      reserved !== candidate &&
+      reserved.phase !== 'done' &&
+      this.canRun(reserved) &&
+      this.scheduler.priority(candidate) >= this.scheduler.priority(reserved) &&
+      (['inputBytes', 'scratchBytes', 'outputBytes'] as const).some(
+        (key) =>
+          reserved.cost[key] > this.ledger.limits[key] - this.ledger.used[key] &&
+          candidate.cost[key] > 0,
+      )
+    );
+  }
+  private taskBlockers(job: Job): AdmissionBlocker[] {
+    if (job.phase === 'produce') return ['preparing'];
+    const reasons: AdmissionBlocker[] = [];
+    if (!this.scheduler.isHead(job)) reasons.push('lane-order');
+    const producing = !!job.preparation && !job.reserved;
+    if (
+      job.options.priority !== 'interactive' &&
+      ((producing
+        ? [...this.preparationWindow].filter((j) => j.options.priority !== 'interactive').length >=
+          this.options.maxPreparingTasks - this.interactive.preparingTasks
+        : this.nonInteractiveActive >=
+          this.options.maxActiveTasks - this.interactive.activeTasks) ||
+        (!job.reserved &&
+          ((!job.options.discardResult &&
+            this.nonInteractiveResults >=
+              this.options.maxResultLeases - this.interactive.resultLeases) ||
+            (!this.ledger.fits(job.cost, job.options.priority) && this.ledger.fits(job.cost)))))
+    )
+      reasons.push('interactive-reserve');
+    if (producing && this.preparationWindow.size >= this.options.maxPreparingTasks)
+      reasons.push('preparation-window');
+    if (!producing && this.active >= this.options.maxActiveTasks) reasons.push('active-tasks');
+    if (!job.reserved) {
+      if (
+        !job.options.discardResult &&
+        this.resultReservations + this.leaseCount >= this.options.maxResultLeases
+      )
+        reasons.push('result-leases');
+      for (const [key, reason] of [
+        ['inputBytes', 'input-budget'],
+        ['scratchBytes', 'scratch-budget'],
+        ['outputBytes', 'output-budget'],
+      ] as const)
+        if (job.cost[key] > this.ledger.limits[key] - this.ledger.used[key]) reasons.push(reason);
+      if (this.protectedBudget(job)) reasons.push('budget-reservation');
+    }
+    if (!producing) {
+      const slot = job.session?.slot;
+      if (job.session?.lost) reasons.push('session-lost');
+      else if (slot) {
+        if (slot.job) reasons.push('session-busy');
+        if (slot.state === 'starting') reasons.push('session-starting');
+        if (slot.state === 'closing') reasons.push('worker-closing');
+        if (slot.releases.size) reasons.push('scope-release');
+        if (slot.control) reasons.push('maintenance');
+      } else if (job.candidates) {
+        if (job.candidates.every((s) => s.closed || s.lost)) reasons.push('session-lost');
+        else if (!this.groupSlot(job)) {
+          reasons.push('session-busy');
+          if (job.candidates.some((s) => s.slot?.control)) reasons.push('maintenance');
+        }
+      } else
+        reasons.push(...this.poolBlockers(this.pools.get(job.options.pool)!, job.options.priority));
+    }
+    return reasons.length ? reasons : ['scheduler-turn'];
+  }
 
   createScope(label = 'scope'): RuntimeScope<T> {
     return this._createScope(label);
+  }
+
+  /** @internal */
+  _acquireResource(
+    options: ResourceOptions,
+    scope?: ScopeRecord,
+    session?: SessionRecord,
+  ): ResourceLease {
+    if (this.closed || scope?.closed || session?.closed || session?.lost)
+      throw new RuntimeError('CLOSED', 'Resource owner is closed');
+    if (!options || options.kind !== 'resident')
+      throw new RuntimeError('INVALID_ARGUMENT', 'Resource kind must be resident');
+    const priority = this.priority(options.priority ?? session?.priority);
+    if (this.resourceLeases.size >= this.options.maxResourceLeases)
+      throw new RuntimeError('BUDGET_EXCEEDED', 'Resident resource lease limit reached');
+    const lease = new ResidentLease(
+      this.ledger,
+      options.bytes,
+      () => {
+        this.resourceLeases.delete(lease);
+        scope?.resources.delete(lease);
+        session?.resources.delete(lease);
+        this.schedule();
+      },
+      () => this.schedule(),
+      priority,
+    );
+    this.resourceLeases.add(lease);
+    scope?.resources.add(lease);
+    session?.resources.add(lease);
+    return lease;
   }
 
   /** Idempotent shutdown with confirmed physical completion. */
   dispose(): Promise<void> {
     if (this.disposal) return this.disposal;
     this.closed = true;
+    clearTimeout(this.adaptiveTimer);
+    clearTimeout(this.schedulerTimer);
     const work = [...this.jobs.values()].map((job) => job.settled.promise);
     const scopes = [...this.scopes].filter((scope) => !scope.parent);
     const scopeStops = scopes.map((scope) => this._disposeScope(scope));
@@ -268,6 +955,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
         );
       }
       this.affinity.clear();
+      for (const lease of this.resourceLeases) lease.release();
       this.scheduler.releaseScope(this.prefix);
     })();
     return this.disposal;
@@ -288,6 +976,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       jobs: new Set(),
       sessions: new Set(),
       leases: new Set(),
+      resources: new Set(),
       touched: new Set(),
     };
     parent?.children.add(record);
@@ -296,18 +985,225 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
   }
 
   /** @internal */
-  _session(scope: ScopeRecord, pool: string): WorkerSession<T> {
+  _session(scope: ScopeRecord, pool: string, options: SessionOptions = {}): WorkerSession<T> {
+    return new WorkerSession(this, this.newSession(scope, pool, options));
+  }
+  /** @internal */
+  _sessionGroup(scope: ScopeRecord, sessions: readonly WorkerSession<T>[]): SessionGroup<T> {
+    if (!Array.isArray(sessions) || sessions.length < 1 || sessions.length > 128)
+      throw new RuntimeError('INVALID_ARGUMENT', 'Session groups require 1 to 128 bound Sessions');
+    const records = [...new Set(sessions.map((session) => session._groupRecord(this, scope)))];
+    if (records.some((r) => r.pool !== records[0]!.pool || r.priority !== records[0]!.priority))
+      throw new RuntimeError(
+        'INVALID_ARGUMENT',
+        'Session group members must share a pool and admission class',
+      );
+    return new SessionGroup(this, scope, records);
+  }
+  private newSession(scope: ScopeRecord, pool: string, options: SessionOptions): SessionRecord {
     if (this.closed || scope.closed) throw new RuntimeError('CLOSED', 'Scope is closed');
     if (!this.pools.has(pool)) throw new RuntimeError('INVALID_ARGUMENT', `Unknown pool: ${pool}`);
+    if (!options || (options.reclaimable !== undefined && typeof options.reclaimable !== 'boolean'))
+      throw new RuntimeError('INVALID_ARGUMENT', 'reclaimable must be boolean');
     const record: SessionRecord = {
+      priority: this.priority(options.priority),
       id: `${scope.id}/session-${++this.serial}`,
       scope,
       pool,
       closed: false,
       leases: new Set(),
+      reclaimable: options.reclaimable ?? false,
+      resources: new Set(),
+      reclaimPriority: integer(options.reclaimPriority ?? 0, 'reclaimPriority'),
+      reclaimed: false,
+      delivering: false,
     };
     scope.sessions.add(record);
-    return new WorkerSession(this, record);
+    return record;
+  }
+
+  /** @internal */
+  _acquireSession(
+    scope: ScopeRecord,
+    pool: string,
+    options: SessionAdmissionOptions = {},
+  ): Promise<WorkerSession<T>> {
+    try {
+      return this.requestSession(scope, pool, options);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+  private requestSession(
+    scope: ScopeRecord,
+    pool: string,
+    options: SessionAdmissionOptions,
+  ): Promise<WorkerSession<T>> {
+    if (!options || typeof options !== 'object')
+      throw new RuntimeError('INVALID_ARGUMENT', 'Session admission options must be an object');
+    if (options.mode !== undefined && options.mode !== 'wait' && options.mode !== 'immediate')
+      return Promise.reject(new RuntimeError('INVALID_ARGUMENT', 'Unknown Session admission mode'));
+    const duration = timeout(
+      options.timeoutMs ?? this.options.queueTimeoutMs,
+      'Session admission timeout',
+    );
+    if (options.residentBytes !== undefined)
+      this.ledger.validate(
+        { residentBytes: options.residentBytes },
+        this.priority(options.priority),
+      );
+    if (options.signal?.aborted) return Promise.reject(aborted(options.signal.reason));
+    if (this.queue.size + this.acquisitions.size >= this.options.maxQueuedTasks)
+      return Promise.reject(new RuntimeError('QUEUE_FULL', 'Admission queue is full'));
+    const session = this.newSession(scope, pool, options);
+    const request: SessionRequest<T> = {
+      session,
+      result: deferred<WorkerSession<T>>(),
+      mode: options.mode ?? 'wait',
+      residentBytes: options.residentBytes,
+    };
+    this.acquisitions.set(session, request);
+    const cancel = () => this.finishAcquisition(request, aborted(options.signal?.reason));
+    options.signal?.addEventListener('abort', cancel, { once: true });
+    request.removeSignal = () => options.signal?.removeEventListener('abort', cancel);
+    request.timer = setTimeout(
+      () =>
+        this.finishAcquisition(
+          request,
+          new RuntimeError('QUEUE_TIMEOUT', 'Session admission timed out'),
+        ),
+      duration,
+    );
+    this.drain();
+    if (request.mode === 'immediate' && this.acquisitions.has(session) && !session.slot)
+      this.finishAcquisition(
+        request,
+        new SessionAdmissionError(pool, this.sessionBlockers(session)),
+      );
+    return request.result.promise;
+  }
+  private finishAcquisition(request: SessionRequest<T>, error?: Error): void {
+    if (!this.acquisitions.delete(request.session)) return;
+    clearTimeout(request.timer);
+    request.removeSignal?.();
+    if (error) {
+      request.result.reject(error);
+      void this._disposeSession(request.session).catch((cause) =>
+        this.observe(
+          new RuntimeError('WORKER_FAILED', 'Session admission cleanup failed', { cause }),
+        ),
+      );
+      this.schedule(`pool:${request.session.pool}`, 'reservation');
+    } else {
+      request.session.delivering = true;
+      request.result.resolve(new WorkerSession(this, request.session));
+      // A ready message may already have scheduled a drain. Keep the replica protected
+      // until the awaiting caller gets its first opportunity to enqueue initialization.
+      queueMicrotask(() => {
+        request.session.delivering = false;
+        this.schedule(`pool:${request.session.pool}`, 'workers', 'reservation');
+      });
+    }
+  }
+  private admitSessions(): void {
+    const requests = [...this.acquisitions.values()].sort(
+      (a, b) =>
+        Number(a.session.reclaimable) - Number(b.session.reclaimable) ||
+        priorities[a.session.priority] - priorities[b.session.priority],
+    );
+    for (const request of requests) {
+      const session = request.session;
+      if (!this.acquisitions.has(session)) continue;
+      if (session.slot) continue;
+      try {
+        // Optional replicas cannot take capacity while a required Session is waiting.
+        if (session.reclaimable && this.waitingPrimary(session.pool)) continue;
+        const bytes = request.residentBytes;
+        if (bytes !== undefined) {
+          const bytePressure = !this.ledger.fits({ residentBytes: bytes }, session.priority);
+          const leasePressure = this.resourceLeases.size >= this.options.maxResourceLeases;
+          if (bytePressure || leasePressure) {
+            if (request.mode === 'wait' && !session.reclaimable) {
+              const victim = this.slots()
+                .filter(
+                  (slot) =>
+                    this.reclaimableSession(slot) &&
+                    [...slot.session!.resources].some((r) =>
+                      bytePressure ? r.bytes > 0 : !r.released,
+                    ),
+                )
+                .sort(
+                  (a, b) =>
+                    a.session!.reclaimPriority - b.session!.reclaimPriority || a.used - b.used,
+                )[0];
+              this.reclaimIdle(victim, 'resident');
+            }
+            continue;
+          }
+        }
+        const pool = this.pools.get(session.pool)!;
+        const capacity =
+          [...pool.slots].some(
+            (slot) => this.available(slot) && this.slotClass(slot, session.priority),
+          ) || this.canSpawn(pool, session.priority);
+        if (!capacity) {
+          if (request.mode === 'wait')
+            this.reclaimIdle(this.reclaimVictim(pool, !session.reclaimable, session.priority));
+          continue;
+        }
+        const binding = deferred<void>();
+        session.binding = binding.promise;
+        let slot: Slot | undefined;
+        try {
+          if (bytes !== undefined) {
+            // Reserve before invoking the factory, which may synchronously reenter the runtime.
+            session.resident = this._acquireResource(
+              { kind: 'resident', bytes, priority: session.priority },
+              session.scope,
+              session,
+            );
+          }
+          slot = this.findPoolSlot(
+            pool,
+            [],
+            request.mode === 'wait',
+            !session.reclaimable,
+            (created) => {
+              // Establish ownership before subscriptions/hello can synchronously fail or cancel.
+              session.slot = created;
+              created.session = session;
+              session.scope.touched.add(created);
+              clearTimeout(created.idleTimer);
+            },
+            session.priority,
+          );
+        } finally {
+          // Once an endpoint exists, even a failed handshake must cross physical cleanup.
+          if (!session.slot) {
+            session.resident?.release();
+            session.resident = undefined;
+          }
+          binding.resolve();
+          session.binding = undefined;
+        }
+        if (!slot) continue;
+        // Disposal already awaits binding and will terminate any endpoint returned after cancel.
+        if (!this.acquisitions.has(session) || session.closed || session.scope.closed) continue;
+        void slot.ready.promise.then(
+          () => {
+            if (session.lost || session.closed || slot.state !== 'ready')
+              this.finishAcquisition(
+                request,
+                session.lost ?? new RuntimeError('CLOSED', 'Session closed during startup'),
+              );
+            else this.finishAcquisition(request);
+          },
+          (error) => this.finishAcquisition(request, asError(error)),
+        );
+      } catch (error) {
+        this.finishAcquisition(request, asError(error));
+      }
+    }
   }
 
   /** @internal */
@@ -321,6 +1217,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       scratchBytes: number;
       timeoutMs?: number;
     },
+    candidates?: readonly SessionRecord[],
   ): TaskHandle<T[K]['output']> {
     if (this.closed || scope.closed || session?.closed)
       throw new RuntimeError('CLOSED', 'Scope or session is closed');
@@ -347,7 +1244,28 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       ...budget,
       scratchBytes: Math.max(budget.scratchBytes, preparation?.scratchBytes ?? 0),
     };
-    this.ledger.validate(cost);
+    const priority = this.priority(raw.priority ?? session?.priority);
+    if (
+      priority !== 'interactive' &&
+      [session, ...(candidates ?? [])].some(
+        (s) =>
+          s &&
+          (s.slot
+            ? !this.slotClass(s.slot, priority)
+            : s.priority === 'interactive' &&
+              !!(
+                this.interactive.workers ||
+                pool.options.interactiveWorkers ||
+                this.ledger.protected.cacheBytes
+              )),
+      )
+    )
+      throw new RuntimeError(
+        'INVALID_ARGUMENT',
+        'Tasks on a protected interactive Session must remain interactive',
+      );
+    this.ledger.validate(cost, priority);
+    pool.lastDemand = performance.now();
     if (
       raw.blobLimits !== undefined &&
       (!raw.blobLimits || typeof raw.blobLimits !== 'object' || Array.isArray(raw.blobLimits))
@@ -371,14 +1289,16 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       raw.executionTimeoutMs ?? this.options.executionTimeoutMs,
       'executionTimeoutMs',
     );
-    if (this.queue.size >= this.options.maxQueuedTasks)
+    if (this.queue.size + this.acquisitions.size >= this.options.maxQueuedTasks)
       throw new RuntimeError('QUEUE_FULL', 'Waiting queue is full');
     const order = ++this.serial;
+    const affinityKeys = this.normalizeAffinity(raw.affinity);
     const job: Job = {
       id: `${this.prefix}/job-${order}`,
       order,
       groupKey: `${scope.id}\0${raw.group ?? 'default'}`,
-      laneKey: `${raw.pool}\0${session?.id ?? ''}`,
+      laneKey: `${raw.pool}\0${session?.id ?? candidates?.map((s) => s.id).join(',') ?? ''}`,
+      affinityKeys,
       phase: 'queue',
       name,
       cost,
@@ -391,8 +1311,11 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
         : undefined,
       scope,
       session,
+      candidates,
       options: {
         ...raw,
+        priority,
+        affinity: undefined, // The bounded, immutable submission snapshot lives in affinityKeys.
         budget,
         blobLimits,
         cancellation,
@@ -447,6 +1370,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     name: K,
     options: PreparedTaskOptions<T[K]['input']>,
     session?: SessionRecord,
+    candidates?: readonly SessionRecord[],
   ): TaskHandle<T[K]['output']> {
     const { prepareAsync, preparationScratchBytes, preparationTimeoutMs, ...rest } = options;
     if (typeof prepareAsync !== 'function')
@@ -467,6 +1391,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
         scratchBytes: preparationScratchBytes,
         timeoutMs: preparationTimeoutMs,
       },
+      candidates,
     );
   }
 
@@ -497,6 +1422,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       .then(() => {
         this.scheduler.releaseScope(`${scope.id}\0`);
         scope.touched.clear();
+        for (const lease of scope.resources) lease.release();
         scope.parent?.children.delete(scope);
         this.scopes.delete(scope);
       })
@@ -511,21 +1437,30 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
   _disposeSession(session: SessionRecord): Promise<void> {
     if (session.disposal) return session.disposal;
     session.closed = true;
+    const acquisition = this.acquisitions.get(session);
+    if (acquisition) {
+      this.acquisitions.delete(session);
+      clearTimeout(acquisition.timer);
+      acquisition.removeSignal?.();
+      acquisition.result.reject(new RuntimeError('CLOSED', 'Session disposed during admission'));
+    }
     for (const lease of [...session.leases]) lease.release();
     const jobs = [...session.scope.jobs].filter((job) => job.session === session);
     for (const job of jobs) this.cancel(job, new RuntimeError('CLOSED', 'Session disposed'));
     // A session owns its physical worker exclusively, so termination cannot kill
     // another session or another scope's active task.
-    const slot = session.slot;
-    const stop = slot
-      ? (async () => {
-          if (slot.state === 'ready' && !slot.job) await this.releaseScope(slot, session.scope.id);
-          await this.retire(slot, new RuntimeError('CLOSED', 'Session disposed'));
-        })()
-      : Promise.resolve();
+    const stop = (async () => {
+      if (session.binding) await session.binding;
+      const slot = session.slot;
+      if (slot) {
+        if (slot.state === 'ready' && !slot.job) await this.releaseScope(slot, session.scope.id);
+        await this.retire(slot, new RuntimeError('CLOSED', 'Session disposed'));
+      }
+    })();
     session.disposal = Promise.all([stop, ...jobs.map((job) => job.settled.promise)])
       .then(() => {
         session.scope.sessions.delete(session);
+        for (const resource of session.resources) resource.release();
       })
       .catch((error) => {
         session.disposal = undefined;
@@ -537,7 +1472,11 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
   private slots(): Slot[] {
     return [...this.pools.values()].flatMap((pool) => [...pool.slots]);
   }
-  private schedule(): void {
+  private poolKey(pool: Pool): string {
+    return `pool:${[...this.pools].find(([, p]) => p === pool)![0]}`;
+  }
+  private schedule(...resources: string[]): void {
+    for (const key of resources) this.scheduler.wake(key);
     if (this.closed || this.scheduled) return;
     this.scheduled = true;
     queueMicrotask(() => {
@@ -549,62 +1488,73 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     if (this.closed || this.draining) return;
     this.draining = true;
     try {
+      this.admitSessions();
       while (this.queue.size) {
         const now = performance.now();
         let chosen: Slot | undefined;
         const job = this.scheduler.select(
           now,
           (candidate) => {
-            if (candidate.phase !== 'queue' && candidate.phase !== 'prepared') return false;
+            const block = (...keys: string[]) => {
+              this.scheduler.suspend(candidate, keys);
+              return false;
+            };
+            if (candidate.phase !== 'queue' && candidate.phase !== 'prepared')
+              return block(`prepare:${candidate.id}`);
             const producing = !!candidate.preparation && !candidate.reserved;
+            const interactive = candidate.options.priority === 'interactive';
             if (
               producing
-                ? this.preparationWindow.size >= this.options.maxPreparingTasks
-                : this.active >= this.options.maxActiveTasks
+                ? this.preparationWindow.size >= this.options.maxPreparingTasks ||
+                  (!interactive &&
+                    [...this.preparationWindow].filter((j) => j.options.priority !== 'interactive')
+                      .length >=
+                      this.options.maxPreparingTasks - this.interactive.preparingTasks)
+                : this.active >= this.options.maxActiveTasks ||
+                  (!interactive &&
+                    this.nonInteractiveActive >=
+                      this.options.maxActiveTasks - this.interactive.activeTasks)
             )
-              return false;
+              return block(producing ? 'preparing' : 'active');
             if (candidate.reserved) {
               try {
                 chosen = this.findSlot(candidate);
               } catch (error) {
                 this.finish(candidate, undefined, asError(error));
               }
-              return chosen !== undefined;
+              return chosen !== undefined || block(...this.slotWaitKeys(candidate));
             }
             if (
               !candidate.options.discardResult &&
-              this.resultReservations + this.leaseCount >= this.options.maxResultLeases
+              (this.resultReservations + this.leaseCount >= this.options.maxResultLeases ||
+                (!interactive &&
+                  this.nonInteractiveResults >=
+                    this.options.maxResultLeases - this.interactive.resultLeases))
             )
-              return false;
+              return block('results');
             if (
               this.reservation &&
               (this.reservation.phase === 'done' || !this.canRun(this.reservation))
             )
               this.reservation = undefined;
             const reserved = this.reservation;
-            if (
-              reserved &&
-              reserved !== candidate &&
-              this.scheduler.priority(candidate) >= this.scheduler.priority(reserved)
-            ) {
-              const used = this.ledger.used,
-                limits = this.ledger.limits;
-              const keys = ['inputBytes', 'scratchBytes', 'outputBytes'] as const;
-              if (
-                keys.some(
-                  (key) => reserved.cost[key] > limits[key] - used[key] && candidate.cost[key] > 0,
-                )
-              )
-                return false;
-            }
-            if (!this.ledger.fits(candidate.cost)) {
+            if (this.protectedBudget(candidate)) return block('reservation');
+            if (!this.ledger.fits(candidate.cost, candidate.options.priority)) {
               if (
                 !reserved &&
                 now - candidate.enqueuedAt >= this.options.budgetWaitMs &&
                 this.canRun(candidate)
               )
                 this.reservation = candidate;
-              return false;
+              if (
+                !candidate.admissionTimer &&
+                now - candidate.enqueuedAt < this.options.budgetWaitMs
+              )
+                candidate.admissionTimer = setTimeout(
+                  () => this.schedule('budget', 'reservation'),
+                  this.options.budgetWaitMs - (now - candidate.enqueuedAt),
+                );
+              return block('budget', ...this.slotWaitKeys(candidate));
             }
             if (producing) return true;
             try {
@@ -613,83 +1563,271 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
               this.failQueued(candidate, asError(error));
               return false;
             }
-            return chosen !== undefined;
+            return chosen !== undefined || block(...this.slotWaitKeys(candidate));
           },
           (candidate) => !candidate.reserved,
         );
         if (!job) break;
-        if (this.reservation === job) this.reservation = undefined;
+        if (this.reservation === job) {
+          this.reservation = undefined;
+          this.scheduler.wake('reservation');
+        }
         if (job.preparation && !job.reserved) this.startPreparation(job);
         else if (chosen) this.admit(job, chosen);
       }
     } finally {
       this.draining = false;
+      clearTimeout(this.schedulerTimer);
+      const promotion = this.scheduler.nextPromotionAt;
+      if (promotion !== undefined)
+        this.schedulerTimer = setTimeout(
+          () => this.schedule(),
+          Math.max(0, promotion - performance.now()),
+        );
     }
   }
-  private canRun(job: Job): boolean {
-    if (job.session?.lost) return false;
-    if (job.session?.slot) return !job.session.slot.job && job.session.slot.state === 'ready';
+  private slotWaitKeys(job: Job): string[] {
     const pool = this.pools.get(job.options.pool)!;
-    if ([...pool.slots].some((slot) => !slot.job && !slot.session && slot.state === 'ready'))
+    return job.session?.slot || job.candidates || pool.slots.size >= pool.capacity
+      ? [this.poolKey(pool)]
+      : [this.poolKey(pool), 'workers', 'cache-budget'];
+  }
+  private canRun(job: Job): boolean {
+    if (job.candidates)
+      return job.candidates.some((s) => !s.closed && !s.lost) && !!this.groupSlot(job);
+    if (job.session?.lost) return false;
+    if (job.session?.slot)
+      return (
+        !job.session.slot.job &&
+        !job.session.slot.releases.size &&
+        !job.session.slot.control &&
+        this.slotClass(job.session.slot, job.options.priority!) &&
+        job.session.slot.state === 'ready'
+      );
+    const pool = this.pools.get(job.options.pool)!;
+    if (
+      [...pool.slots].some(
+        (slot) =>
+          this.available(slot) &&
+          this.slotClass(slot, job.options.priority!) &&
+          slot.state === 'ready',
+      )
+    )
       return true;
-    if (pool.slots.size >= pool.options.size) return false;
-    const all = this.slots();
+    const reclaimSession = !!job.session && !job.session.reclaimable;
+    if (pool.slots.size >= pool.capacity)
+      return !!this.reclaimVictim(pool, reclaimSession, job.options.priority);
     return (
-      (all.length < this.options.maxWorkers &&
-        this.ledger.fits({ cacheBytes: pool.options.cacheBytes })) ||
-      all.some((slot) => slot.pool !== pool && !slot.job && !slot.session && slot.state === 'ready')
+      this.canSpawn(pool, job.options.priority!) ||
+      !!this.reclaimVictim(pool, reclaimSession, job.options.priority)
     );
   }
-  private affinityId(job: Job): string | undefined {
-    return job.options.affinity === undefined
-      ? undefined
-      : `${job.scope.id}\0${job.options.pool}\0${job.options.affinity}`;
+  private normalizeAffinity(affinity: TaskOptions<unknown>['affinity']): readonly string[] {
+    if (affinity === undefined) return [];
+    const keys = typeof affinity === 'string' ? [affinity] : affinity?.keys;
+    if (
+      !Array.isArray(keys) ||
+      keys.length > 128 ||
+      keys.some((key) => typeof key !== 'string' || key.length > 1024)
+    )
+      throw new RuntimeError(
+        'INVALID_ARGUMENT',
+        'Affinity requires at most 128 string keys of at most 1024 characters',
+      );
+    return [...new Set<string>(keys)];
+  }
+  private affinityIds(job: Job): string[] {
+    return job.affinityKeys.map(
+      (key) => `${job.scope.id}\0${JSON.stringify([job.options.pool, key])}`,
+    );
+  }
+  private rememberAffinity(job: Job, slot: Slot): void {
+    for (const key of this.affinityIds(job)) {
+      const placements = this.affinity.get(key) ?? new Set<Slot>();
+      placements.add(slot);
+      this.affinity.delete(key);
+      this.affinity.set(key, placements);
+      while (this.affinity.size > this.options.maxAffinityEntries)
+        this.affinity.delete(required(this.affinity.keys().next().value, 'Affinity entry'));
+    }
   }
   private findSlot(job: Job): Slot | undefined {
+    if (job.candidates) return this.groupSlot(job);
     if (job.session?.lost) throw job.session.lost;
     if (job.session?.slot) {
       const slot = job.session.slot;
-      return !slot.job && (slot.state === 'ready' || slot.state === 'starting') ? slot : undefined;
+      return !slot.job &&
+        !slot.releases.size &&
+        !slot.control &&
+        this.slotClass(slot, job.options.priority!) &&
+        (slot.state === 'ready' || slot.state === 'starting')
+        ? slot
+        : undefined;
     }
     const pool = required(this.pools.get(job.options.pool), 'Task pool');
-    const available = [...pool.slots].filter(
-      (slot) => !slot.job && !slot.session && (slot.state === 'ready' || slot.state === 'starting'),
+    if (job.session?.reclaimable && this.waitingPrimary(job.options.pool)) return undefined;
+    return this.findPoolSlot(
+      pool,
+      this.affinityIds(job),
+      true,
+      !!job.session && !job.session.reclaimable,
+      undefined,
+      job.options.priority,
     );
-    const affinity = this.affinityId(job);
-    const preferred = affinity ? this.affinity.get(affinity) : undefined;
-    if (preferred && available.includes(preferred)) return preferred;
-    if (available.length) return available.sort((a, b) => a.used - b.used)[0];
-    if (pool.slots.size >= pool.options.size) return undefined;
-    const all = this.slots();
-    if (
-      all.length >= this.options.maxWorkers ||
-      !this.ledger.fits({ cacheBytes: pool.options.cacheBytes })
-    ) {
-      if (this.reclaiming || all.some((slot) => slot.state === 'closing')) return undefined;
-      const victim = all
-        .filter(
-          (slot) => slot.pool !== pool && !slot.job && !slot.session && slot.state === 'ready',
-        )
-        .sort((a, b) => a.used - b.used)[0];
-      if (victim) {
-        this.reclaiming = true;
-        void this.retire(
-          victim,
-          new RuntimeError('CLOSED', 'Idle worker reclaimed for another pool'),
-        )
-          .finally(() => {
-            this.reclaiming = false;
-            this.schedule();
-          })
-          .catch(() => {});
-      }
+  }
+  private groupSlot(job: Job): Slot | undefined {
+    const sessions = job.candidates!.filter((s) => !s.closed && !s.lost);
+    if (!sessions.length)
+      throw new RuntimeError('SESSION_LOST', 'All Session group members are closed or lost');
+    const score = (session: SessionRecord) => {
+      const keys = new Set(
+        session
+          .slot!.reports.filter((r) => r.scope === job.scope.id && r.session === session.id)
+          .flatMap((r) => [...r.keys]),
+      );
+      return job.affinityKeys.reduce((n, key) => n + Number(keys.has(key)), 0);
+    };
+    return sessions
+      .filter(
+        (s) =>
+          s.slot?.state === 'ready' &&
+          !s.slot.job &&
+          !s.slot.releases.size &&
+          !s.slot.control &&
+          this.slotClass(s.slot, job.options.priority!),
+      )
+      .sort((a, b) => score(b) - score(a) || a.slot!.used - b.slot!.used)[0]?.slot;
+  }
+  private available(slot: Slot): boolean {
+    return (
+      !slot.job &&
+      !slot.control &&
+      !slot.session &&
+      slot.releases.size === 0 &&
+      (slot.state === 'ready' || slot.state === 'starting')
+    );
+  }
+  private reclaimableSession(slot: Slot): boolean {
+    const session = slot.session;
+    return (
+      !!session &&
+      session.reclaimable &&
+      !session.closed &&
+      !session.lost &&
+      !session.delivering &&
+      !this.acquisitions.has(session) &&
+      slot.state === 'ready' &&
+      !slot.control &&
+      !slot.job &&
+      !slot.releases.size &&
+      session.leases.size === 0 &&
+      ![...session.scope.jobs].some(
+        (job) => job.session === session || job.candidates?.includes(session),
+      )
+    );
+  }
+  private reclaimVictim(
+    pool: Pool,
+    sessions: boolean,
+    priority: Priority = 'foreground',
+  ): Slot | undefined {
+    const full = pool.slots.size >= pool.capacity;
+    return this.slots()
+      .filter(
+        (slot) =>
+          (priority === 'interactive' ||
+            ((this.slots().filter((s) => s.priority !== 'interactive').length <
+              this.options.maxWorkers - this.interactive.workers ||
+              slot.priority !== 'interactive') &&
+              ([...pool.slots].filter((s) => s.priority !== 'interactive').length <
+                pool.capacity - pool.options.interactiveWorkers ||
+                (slot.pool === pool && slot.priority !== 'interactive')))) &&
+          (!full || slot.pool === pool) &&
+          ((!slot.session &&
+            (slot.pool !== pool || !this.slotClass(slot, priority)) &&
+            this.available(slot) &&
+            slot.state === 'ready') ||
+            (sessions && this.reclaimableSession(slot))),
+      )
+      .sort(
+        (a, b) =>
+          Number(!!a.session) - Number(!!b.session) ||
+          (a.session?.reclaimPriority ?? 0) - (b.session?.reclaimPriority ?? 0) ||
+          a.used - b.used,
+      )[0];
+  }
+  private findPoolSlot(
+    pool: Pool,
+    affinity: readonly string[] = [],
+    reclaim = true,
+    sessions = false,
+    bind?: (slot: Slot) => void,
+    priority: Priority = 'foreground',
+  ): Slot | undefined {
+    const available = [...pool.slots].filter(
+      (slot) => this.available(slot) && this.slotClass(slot, priority),
+    );
+    const score = (slot: Slot) =>
+      affinity.reduce((n, key) => n + Number(this.affinity.get(key)?.has(slot) ?? false), 0);
+    if (available.length) {
+      const slot = available.sort((a, b) => score(b) - score(a) || a.used - b.used)[0]!;
+      bind?.(slot);
+      return slot;
+    }
+    if (!this.canSpawn(pool, priority)) {
+      if (reclaim) this.reclaimIdle(this.reclaimVictim(pool, sessions, priority));
       return undefined;
     }
-    return this.spawn(pool);
+    return this.spawn(pool, bind, priority);
+  }
+  private reclaimIdle(victim: Slot | undefined, reason: ReclaimReason = 'capacity'): void {
+    // A failed termination remains charged, but must not block healthy victims forever.
+    if (
+      victim &&
+      !this.reclaiming &&
+      !this.maintenance &&
+      !this.slots().some((slot) => slot.state === 'closing' && !slot.terminationFailed)
+    ) {
+      this.reclaiming = true;
+      const stop = this.reclaimSlot(victim, reason);
+      void stop
+        .finally(() => {
+          this.reclaiming = false;
+          this.schedule('workers', 'cache-budget');
+        })
+        .catch((cause) =>
+          this.observe(
+            new RuntimeError('WORKER_FAILED', 'Worker reclamation failed; capacity remains held', {
+              cause,
+            }),
+          ),
+        );
+    }
   }
 
-  private spawn(pool: Pool): Slot {
-    const releaseCache = this.ledger.reserve({ cacheBytes: pool.options.cacheBytes });
+  private reclaimSlot(slot: Slot, reason: ReclaimReason): Promise<void> {
+    if (slot.reclaim) return slot.reclaim;
+    const stats = slot.pool.reclaim;
+    stats.attempts++;
+    stats.byReason[reason]++;
+    if (slot.session) slot.session.reclaimed = true;
+    slot.reclaim = (
+      slot.session
+        ? this._disposeSession(slot.session)
+        : this.retire(slot, new RuntimeError('CLOSED', `Idle worker reclaimed: ${reason}`))
+    )
+      .then(() => {
+        stats.succeeded++;
+        if (slot.session) this.counters.sessionsReclaimed++;
+      })
+      .catch((error) => {
+        stats.failed++;
+        throw error;
+      });
+    return slot.reclaim;
+  }
+  private spawn(pool: Pool, bind?: (slot: Slot) => void, priority: Priority = 'foreground'): Slot {
+    const releaseCache = this.ledger.reserve({ cacheBytes: pool.cacheTarget }, priority);
     let endpoint: WorkerEndpoint;
     try {
       endpoint = pool.options.factory();
@@ -710,9 +1848,15 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       releaseCache,
       used: ++this.clock,
       cacheUsed: 0,
+      cacheStats: { hits: 0, misses: 0, evictions: 0 },
+      resourceCacheStats: emptyCacheStats(),
+      reports: [],
+      cacheLimit: pool.cacheTarget,
+      priority,
     };
     pool.slots.add(slot);
     this.counters.workerStarts++;
+    bind?.(slot);
     try {
       slot.subscriptions.push(endpoint.onMessage((message) => this.receive(slot, message)));
       slot.subscriptions.push(
@@ -732,7 +1876,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       endpoint.postMessage({
         ...header(slot.epoch),
         type: 'hello',
-        cacheBytes: pool.options.cacheBytes,
+        cacheBytes: slot.cacheLimit,
         cacheEntries: pool.options.cacheEntries,
       });
     } catch (error) {
@@ -746,13 +1890,22 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
   }
   private reserveJob(job: Job): void {
     if (job.reserved) return;
-    job.releaseExecution = this.ledger.reserve({
-      inputBytes: job.cost.inputBytes,
-      scratchBytes: job.cost.scratchBytes,
-    });
-    job.releaseOutput = this.ledger.reserve({ outputBytes: job.cost.outputBytes });
+    job.releaseExecution = this.ledger.reserve(
+      {
+        inputBytes: job.cost.inputBytes,
+        scratchBytes: job.cost.scratchBytes,
+      },
+      job.options.priority,
+    );
+    job.releaseOutput = this.ledger.reserve(
+      { outputBytes: job.cost.outputBytes },
+      job.options.priority,
+    );
     job.reserved = true;
-    if (!job.options.discardResult) this.resultReservations++;
+    if (!job.options.discardResult) {
+      this.resultReservations++;
+      if (job.options.priority !== 'interactive') this.nonInteractiveResults++;
+    }
     clearTimeout(job.queueTimer);
     job.admittedAt = performance.now();
     job.timing.queueMs = job.admittedAt - job.enqueuedAt;
@@ -785,7 +1938,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
         clearTimeout(job.preparationTimer);
         job.timing.prepareMs = performance.now() - started;
         job.preparation = undefined;
-        this.schedule();
+        this.schedule(`prepare:${job.id}`, 'preparing');
       }
     })();
   }
@@ -805,19 +1958,14 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     job.scope.touched.add(slot);
     slot.job = job;
     slot.used = ++this.clock;
+    if (job.candidates) job.session = slot.session;
     if (job.session && !job.session.slot) {
       job.session.slot = slot;
       slot.session = job.session;
     }
-    const key = this.affinityId(job);
-    if (key) {
-      this.affinity.delete(key);
-      this.affinity.set(key, slot);
-      while (this.affinity.size > this.options.maxAffinityEntries)
-        this.affinity.delete(required(this.affinity.keys().next().value, 'Affinity entry'));
-    }
-
     this.active++;
+    if (job.options.priority !== 'interactive') this.nonInteractiveActive++;
+    this.scheduler.wake('preparing');
     job.workerStartedAt = performance.now();
     job.state = 'starting';
     job.phase = 'startup';
@@ -892,6 +2040,70 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       this.finish(job, undefined, asError(error));
     }
   }
+  private updateCacheStats(slot: Slot, raw: unknown): boolean {
+    // Optional for custom endpoints. Only accept monotonic, bounded counters.
+    if (raw === undefined) return true;
+    if (!raw || typeof raw !== 'object') return false;
+    const next = raw as CacheStats;
+    const keys = ['hits', 'misses', 'evictions'] as const;
+    if (keys.some((key) => !Number.isSafeInteger(next[key]) || next[key] < slot.cacheStats[key]))
+      return false;
+    for (const key of keys) {
+      slot.pool.cacheStats[key] = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        slot.pool.cacheStats[key] + next[key] - slot.cacheStats[key],
+      );
+      slot.cacheStats[key] = next[key];
+    }
+    return true;
+  }
+  private updateResourceTelemetry(slot: Slot, stats: unknown, reports: unknown): boolean {
+    try {
+      if (stats === undefined && reports === undefined) return true;
+      const totals = cacheReport(
+        { ...(stats as CacheStats), usedBytes: 0, keys: [] },
+        slot.resourceCacheStats,
+      );
+      if (!Array.isArray(reports) || reports.length > 64) return false;
+      const snapshots: ResourceCacheSnapshot[] = [];
+      const ids = new Set<string>();
+      let keys = 0,
+        reserved = 0;
+      for (const raw of reports) {
+        for (const field of ['id', 'scope', 'session', 'resource'])
+          if (!raw || typeof raw[field] !== 'string' || raw[field].length > 2048) return false;
+        if (ids.has(raw.id)) return false;
+        ids.add(raw.id);
+        const report = cacheReport(raw);
+        keys += report.keys.length;
+        const bytes = integer(raw.reservedBytes, 'resource reservedBytes');
+        reserved += bytes;
+        if (keys > 1024 || report.usedBytes > bytes || reserved > slot.cacheLimit) return false;
+        snapshots.push({
+          ...report,
+          id: raw.id,
+          scope: raw.scope,
+          session: raw.session,
+          resource: raw.resource,
+          reservedBytes: bytes,
+        });
+      }
+      addCacheStats(slot.pool.resourceCacheStats, {
+        hits: totals.hits - slot.resourceCacheStats.hits,
+        misses: totals.misses - slot.resourceCacheStats.misses,
+        evictions: totals.evictions - slot.resourceCacheStats.evictions,
+      });
+      slot.resourceCacheStats = {
+        hits: totals.hits,
+        misses: totals.misses,
+        evictions: totals.evictions,
+      };
+      slot.reports = snapshots;
+      return true;
+    } catch {
+      return false;
+    }
+  }
   private receive(slot: Slot, raw: unknown): void {
     if (slot.state === 'closed' || slot.state === 'closing') return;
     if (!isHeader(raw)) {
@@ -903,6 +2115,52 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     }
     if (raw.epoch !== slot.epoch) return; // Old physical instance; never match by request ID alone.
     const message = raw as FromWorker;
+    if (message.type === 'cache-controlled') {
+      const control = slot.control;
+      if (!control || message.id !== control.id) return;
+      if (
+        !Number.isSafeInteger(message.limit) ||
+        message.limit !== (message.error ? slot.cacheLimit : control.target) ||
+        !Number.isSafeInteger(message.cacheBytes) ||
+        message.cacheBytes < 0 ||
+        message.cacheBytes > message.limit
+      ) {
+        void this.retire(
+          slot,
+          new RuntimeError('PROTOCOL_ERROR', 'Invalid cache control acknowledgement'),
+        );
+        return;
+      }
+      const previous = slot.cacheLimit;
+      slot.cacheLimit = message.limit;
+      if (
+        !this.updateCacheStats(slot, message.cacheStats) ||
+        !this.updateResourceTelemetry(slot, message.resourceCacheStats, message.resourceReports)
+      ) {
+        slot.cacheLimit = previous;
+        void this.retire(
+          slot,
+          new RuntimeError('PROTOCOL_ERROR', 'Invalid cache control telemetry'),
+        );
+        return;
+      }
+      clearTimeout(control.timer);
+      slot.control = undefined;
+      control.extra?.();
+      slot.releaseCache();
+      slot.releaseCache = this.ledger.reserve({ cacheBytes: slot.cacheLimit }, slot.priority);
+      slot.cacheUsed = message.cacheBytes;
+      if (message.error) {
+        try {
+          control.result.reject(decodeError(message.error));
+        } catch (error) {
+          control.result.reject(error);
+        }
+      } else control.result.resolve();
+      this.armIdle(slot);
+      this.schedule(this.poolKey(slot.pool), 'workers', 'cache-budget');
+      return;
+    }
     if (message.type === 'ready') {
       if (slot.state !== 'starting') return;
       if (!Array.isArray(message.tasks) || message.tasks.some((name) => typeof name !== 'string')) {
@@ -916,7 +2174,8 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       slot.tasks = new Set(message.tasks);
       slot.state = 'ready';
       slot.ready.resolve();
-      this.schedule();
+      this.armIdle(slot);
+      this.schedule(this.poolKey(slot.pool), 'workers', 'reservation');
       return;
     }
     if (message.type === 'released') {
@@ -925,8 +2184,10 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       if (
         !Number.isSafeInteger(message.cacheBytes) ||
         message.cacheBytes < 0 ||
-        message.cacheBytes > slot.pool.options.cacheBytes ||
-        (message.error && typeof message.error.message !== 'string')
+        message.cacheBytes > slot.cacheLimit ||
+        (message.error && typeof message.error.message !== 'string') ||
+        !this.updateCacheStats(slot, message.cacheStats) ||
+        !this.updateResourceTelemetry(slot, message.resourceCacheStats, message.resourceReports)
       ) {
         void this.retire(
           slot,
@@ -944,18 +2205,18 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
           void this.retire(slot, asError(error));
         }
         this.armIdle(slot);
-        this.schedule();
+        this.schedule(this.poolKey(slot.pool), 'workers', 'reservation');
         return;
       }
       pending.deferred.resolve();
       if (
         Number.isSafeInteger(message.cacheBytes) &&
         message.cacheBytes >= 0 &&
-        message.cacheBytes <= slot.pool.options.cacheBytes
+        message.cacheBytes <= slot.cacheLimit
       )
         slot.cacheUsed = message.cacheBytes;
       this.armIdle(slot);
-      this.schedule();
+      this.schedule(this.poolKey(slot.pool), 'workers', 'reservation');
       return;
     }
     const job = slot.job;
@@ -1002,7 +2263,9 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       message.workerMs < 0 ||
       !Number.isSafeInteger(message.cacheBytes) ||
       message.cacheBytes < 0 ||
-      message.cacheBytes > slot.pool.options.cacheBytes
+      message.cacheBytes > slot.cacheLimit ||
+      !this.updateCacheStats(slot, message.cacheStats) ||
+      !this.updateResourceTelemetry(slot, message.resourceCacheStats, message.resourceReports)
     ) {
       void this.retire(slot, new RuntimeError('PROTOCOL_ERROR', 'Invalid worker metrics'));
       return;
@@ -1090,6 +2353,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     clearTimeout(job.queueTimer);
     clearTimeout(job.executionTimer);
     clearTimeout(job.preparationTimer);
+    clearTimeout(job.admissionTimer);
     job.removeSignal?.();
     job.removeSignal = undefined;
     this.queue.delete(job);
@@ -1097,9 +2361,15 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     this.jobs.delete(job.id);
     job.scope.jobs.delete(job);
 
-    if (job.slot !== undefined) this.active--;
+    if (job.slot !== undefined) {
+      this.active--;
+      if (job.options.priority !== 'interactive') this.nonInteractiveActive--;
+    }
     this.preparationWindow.delete(job);
-    if (job.reserved && !job.options.discardResult) this.resultReservations--;
+    if (job.reserved && !job.options.discardResult) {
+      this.resultReservations--;
+      if (job.options.priority !== 'interactive') this.nonInteractiveResults--;
+    }
     job.preparedInput = undefined;
     job.preparation = undefined;
     job.releaseExecution?.();
@@ -1121,17 +2391,22 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       job.result.reject(error ?? new RuntimeError('REMOTE_ERROR', 'Missing worker result'));
     } else {
       job.state = 'succeeded';
+      if (slot?.state === 'ready') this.rememberAffinity(job, slot);
       this.counters.completed++;
       this.counters.outputBytes += result.bytes;
       const releaseOutput = required(job.releaseOutput, 'Output reservation');
       job.releaseOutput = undefined;
       this.leaseCount++;
+      if (!job.options.discardResult && job.options.priority !== 'interactive')
+        this.nonInteractiveResults++;
       const lease = new OwnedResult(result.value, result.bytes, () => {
         releaseOutput();
         this.leaseCount--;
+        if (!job.options.discardResult && job.options.priority !== 'interactive')
+          this.nonInteractiveResults--;
         job.scope.leases.delete(lease);
         job.session?.leases.delete(lease);
-        this.schedule();
+        this.schedule('budget', 'results', 'reservation', `pool:${job.options.pool}`, 'workers');
       });
       job.scope.leases.add(lease);
       job.session?.leases.add(lease);
@@ -1147,8 +2422,17 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     job.options.onProgress = undefined;
     job.options.signal = undefined;
     job.slot = undefined;
+    job.candidates = undefined;
     job.settled.resolve();
-    this.schedule();
+    this.schedule(
+      'budget',
+      'active',
+      'preparing',
+      'results',
+      'reservation',
+      `pool:${job.options.pool}`,
+      'workers',
+    );
   }
   private releaseScope(slot: Slot, scope: string): Promise<void> {
     const existing = slot.releases.get(scope);
@@ -1158,7 +2442,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     const timer = setTimeout(() => {
       slot.releases.delete(scope);
       this.armIdle(slot);
-      this.schedule();
+      this.schedule(this.poolKey(slot.pool), 'workers', 'reservation');
       result.reject(
         new RuntimeError('EXECUTION_TIMEOUT', 'Worker scope release acknowledgement timed out'),
       );
@@ -1182,7 +2466,15 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     preparing: string[];
     prepared: string[];
     quarantinedWorkers: number;
-    owners: { id: string; label: string; tasks: number; leases: number; sessions: number }[];
+    owners: {
+      id: string;
+      label: string;
+      tasks: number;
+      leases: number;
+      sessions: number;
+      resources: number;
+      residentBytes: number;
+    }[];
   } {
     return {
       scopes: this.scopes.size,
@@ -1200,6 +2492,8 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
         tasks: scope.jobs.size,
         leases: scope.leases.size,
         sessions: scope.sessions.size,
+        resources: scope.resources.size,
+        residentBytes: [...scope.resources].reduce((sum, lease) => sum + lease.bytes, 0),
       })),
     };
   }
@@ -1230,6 +2524,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       slot.job ||
       slot.state !== 'ready' ||
       slot.releases.size > 0 ||
+      slot.control ||
       !slot.pool.options.idleTimeoutMs
     )
       return;
@@ -1244,6 +2539,10 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     const stopped = deferred<void>();
     slot.stopped = stopped.promise;
     slot.state = 'closing';
+    if (slot.control) {
+      clearTimeout(slot.control.timer);
+      slot.control.result.reject(reason);
+    }
     slot.terminationFailed = false;
     clearTimeout(slot.startupTimer);
     clearTimeout(slot.idleTimer);
@@ -1307,14 +2606,20 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       }
       slot.releases.clear();
       slot.cacheUsed = 0;
+      slot.reports = [];
+      slot.control?.extra?.();
+      slot.control = undefined;
       slot.releaseCache();
       slot.pool.slots.delete(slot);
       for (const scope of this.scopes) scope.touched.delete(slot);
-      for (const [key, value] of this.affinity) if (value === slot) this.affinity.delete(key);
+      for (const [key, placements] of this.affinity) {
+        placements.delete(slot);
+        if (!placements.size) this.affinity.delete(key);
+      }
       this.counters.workerTerminations++;
       if (job && wasPosted) this.finish(job, undefined, reason);
       stopped.resolve();
-      this.schedule();
+      this.schedule(this.poolKey(slot.pool), 'workers', 'cache-budget', 'reservation');
     })();
     return slot.stopped;
   }
@@ -1329,11 +2634,14 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
 }
 
 export class RuntimeScope<T extends Catalog<T> = TaskMap> {
+  readonly resources: ResourceReservations;
   /** @internal */
   constructor(
     private readonly runtime: WorkerRuntime<T>,
     private readonly record: ScopeRecord,
-  ) {}
+  ) {
+    this.resources = { acquire: (options) => this.runtime._acquireResource(options, this.record) };
+  }
   get id(): string {
     return this.record.id;
   }
@@ -1346,8 +2654,14 @@ export class RuntimeScope<T extends Catalog<T> = TaskMap> {
   createScope(label = 'scope'): RuntimeScope<T> {
     return this.runtime._createScope(label, this.record);
   }
-  session(pool: string): WorkerSession<T> {
-    return this.runtime._session(this.record, pool);
+  session(pool: string, options?: SessionOptions): WorkerSession<T> {
+    return this.runtime._session(this.record, pool, options);
+  }
+  acquireSession(pool: string, options?: SessionAdmissionOptions): Promise<WorkerSession<T>> {
+    return this.runtime._acquireSession(this.record, pool, options);
+  }
+  sessionGroup(sessions: readonly WorkerSession<T>[]): SessionGroup<T> {
+    return this.runtime._sessionGroup(this.record, sessions);
   }
   enqueue<K extends TaskName<T>>(
     name: K,
@@ -1371,13 +2685,34 @@ export class RuntimeScope<T extends Catalog<T> = TaskMap> {
 
 /** Required affinity with an exclusive physical worker and fail-closed generation semantics. */
 export class WorkerSession<T extends Catalog<T> = TaskMap> {
+  readonly resources: ResourceReservations;
   /** @internal */
   constructor(
     private readonly runtime: WorkerRuntime<T>,
     private readonly record: SessionRecord,
-  ) {}
+  ) {
+    this.resources = {
+      acquire: (options) => this.runtime._acquireResource(options, this.record.scope, this.record),
+    };
+  }
   get id(): string {
     return this.record.id;
+  }
+  /** @internal */
+  _groupRecord(runtime: WorkerRuntime<T>, scope: ScopeRecord): SessionRecord {
+    if (runtime !== this.runtime || scope !== this.record.scope || this.state !== 'bound')
+      throw new RuntimeError(
+        'INVALID_ARGUMENT',
+        'Session group members must be bound to the same Runtime and Scope',
+      );
+    return this.record;
+  }
+  get reclaimed(): boolean {
+    return this.record.reclaimed;
+  }
+  /** Optional lifetime reservation created atomically by acquireSession. */
+  get resident(): ResourceLease | undefined {
+    return this.record.resident;
   }
   get state(): 'unbound' | 'bound' | 'lost' | 'closed' {
     return this.record.closed
@@ -1412,6 +2747,49 @@ export class WorkerSession<T extends Catalog<T> = TaskMap> {
   }
   dispose(): Promise<void> {
     return this.runtime._disposeSession(this.record);
+  }
+}
+
+/** Borrowed replicas of one business source; the group does not own member lifetimes. */
+export class SessionGroup<T extends Catalog<T> = TaskMap> {
+  /** @internal */
+  constructor(
+    private runtime: WorkerRuntime<T>,
+    private scope: ScopeRecord,
+    private sessions: readonly SessionRecord[],
+  ) {}
+  enqueue<K extends TaskName<T>>(
+    name: K,
+    options: Omit<TaskOptions<T[K]['input']>, 'pool'>,
+  ): TaskHandle<T[K]['output']> {
+    return this.runtime._enqueue(
+      this.scope,
+      name,
+      {
+        ...options,
+        pool: this.sessions[0]!.pool,
+        priority: options.priority ?? this.sessions[0]!.priority,
+      },
+      undefined,
+      undefined,
+      this.sessions,
+    );
+  }
+  enqueuePrepared<K extends TaskName<T>>(
+    name: K,
+    options: Omit<PreparedTaskOptions<T[K]['input']>, 'pool'>,
+  ): TaskHandle<T[K]['output']> {
+    return this.runtime._enqueuePrepared(
+      this.scope,
+      name,
+      {
+        ...options,
+        pool: this.sessions[0]!.pool,
+        priority: options.priority ?? this.sessions[0]!.priority,
+      },
+      undefined,
+      this.sessions,
+    );
   }
 }
 

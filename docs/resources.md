@@ -44,7 +44,9 @@ Runtime 面向可信 Worker。使用 serve 在发送前校验协议消息和额�
 
 ## Worker 本地资源
 
-`cache.set` / `setPinned` 保存可检查的数据，显式 bytes 必须覆盖 dataByteLength 的二进制和元数据计费量。通过外部引用扩大条目时需要重新申报。驻留 Map/Set、Date/RegExp 和 buffer/view 的附加可枚举字段也会检查；检查 view 附加属性需要枚举其索引，索引数量受条目限制；因此大 view 更适合无附加字段的任务结果或显式常驻资源。
+`cache.set` / `setPinned` 保存可检查的数据，显式 bytes 必须覆盖 dataByteLength 的二进制和元数据计费量。通过外部引用扩大条目时需要重新申报。驻留 Map/Set、Date/RegExp 和 buffer/view 的附加可枚举字段也会检查；检查 view 附加属性仍需枚举索引；TypedArray 的索引元素不消耗 maxEntries，只有附加字段消耗遍历边额度。大型数组可直接缓存，但枚举成本仍随长度增长；仅缓存 backing buffer 可避免枚举 view 索引。
+
+纯栅格/数值数据可用 `cache.setBinary(key, view)`：缓存保存同一 backing store 上的新原生 TypedArray/DataView，offset 和 length 固定为调用时的值，不保留原 view 的附加属性或子类行为，不枚举索引、不复制缓冲区。小切片也按整个 backing store 计费。后续写入共享数据可见；不得在缓存仍持有数据时 transfer/detach 或扩容其 backing store。此入口不接受普通对象，需要额外元数据时单独保存。
 
 Session 可用 `cache.setResource(key, value, bytes, disposer)` 保存数据库类实例、WASM 实例等不透明资源。此路径信任声明的 bytes，资源固定在 Session Worker 内，直至显式清理或 Session 关闭。
 
@@ -65,7 +67,7 @@ context.progress 的发送生命周期随任务结束而关闭，结束后的 ch
 
 逻辑取消与物理阶段独立：启动期取消仍受 execution deadline 约束；已经发送的 Worker 任务到期会强制终止；prepare 采用同步构造契约。
 
-协议版本为 5，payload/result 使用 Packet 封装，request 携带 maxScratchBytes。自定义 endpoint 必须支持 progress ACK 与 Scope release ACK。底层传输和异步 disposer 的失败会传递给释放调用方，供其处理或重试。
+协议版本为 6，payload/result 使用 Packet 封装，request 携带 maxScratchBytes。自定义 endpoint 必须支持 progress ACK、Scope release ACK 和 cache-control/cache-controlled。主线程包与 Worker bundle 必须同步更新。底层传输和异步 disposer 的失败会传递给释放调用方，供其处理或重试。
 
 ## File/Blob 附件
 
@@ -96,3 +98,9 @@ iterateResults 的 close 失败通过首次 closed 和触发清理的调用传�
 远端失败以 RuntimeError 传递，code 表示 Runtime 错误类别；remoteError 保存业务 name、字符串 code、message 及可选 stack/details。基本字段从数据属性读取；name/code 最多 128 字符、message 1024 字符、stack 4096 字符，截断时标记 truncated。details 接受有限数字、字符串、布尔值、null、普通对象和数组，最多 8 层、128 次计费访问和 4 KiB 计费量；编码超限或类型不符时标记 detailsOmitted，并保留基本错误。整个错误消息使用独立的有界控制额度。
 
 Host 在发送前整理错误，Runtime 接收时复核错误码、字段和限额。业务失败使用 REMOTE_ERROR，物理 Worker 故障与取消分别使用 WORKER_FAILED 和 ABORTED。业务根据 remoteError 重建自己的错误类型。
+
+## 常驻资源与提前准入
+
+`runtime.resources.acquire` / `scope.resources.acquire` 提供共享 residentBytes 上限下的可 resize 租约。`scope.acquireSession` 提供立即或等待式 Worker 容量准入与显式空闲副本回收。`runtime.diagnostics()` 公开池容量、cache 和等待原因。迁移示例、回收边界、多 key affinity 与可变大小分块契约见 [emap 升级指南](emap-upgrade.md)。
+
+SessionGroup 的 reader footprint 选路、interactive 资源预留、阻塞索引、pressure/trim、可选自适应扩缩容与资源遥测见 [资源调度指南](resource-scheduling.md)。缓存缩容按 Host ACK 归还额度；维护等待活跃任务物理完成，必需 Session 和失败清理继续占用资源。

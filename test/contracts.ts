@@ -95,3 +95,139 @@ scope.enqueue('ping', {
   // @ts-expect-error Main-thread preparation must be synchronous.
   prepare: async () => ({ payload: 'text' }),
 });
+
+const resident = scope.resources.acquire({ kind: 'resident', bytes: 32 });
+resident.resize(64);
+const heldBytes: number = resident.bytes;
+void heldBytes;
+resident.release();
+const admission = scope.acquireSession('cpu', {
+  mode: 'immediate',
+  reclaimable: true,
+  reclaimPriority: 10,
+  residentBytes: 32,
+});
+void admission.then((session) => session.resident?.resize(64));
+void admission;
+scope.enqueue('ping', {
+  pool: 'cpu',
+  affinity: { keys: ['block-a', 'block-b'] },
+  budget: { inputBytes: 8, scratchBytes: 0, outputBytes: 8 },
+  prepare: () => ({ payload: 'text' }),
+});
+// @ts-expect-error Resident budgets require an explicit supported kind.
+scope.resources.acquire({ kind: 'gpu', bytes: 8 });
+scope.enqueue('ping', {
+  pool: 'cpu',
+  // @ts-expect-error Affinity keys must be strings.
+  affinity: { keys: [1] },
+  budget: { inputBytes: 8, scratchBytes: 0, outputBytes: 8 },
+  prepare: () => ({ payload: 'text' }),
+});
+
+import { iterateSizedResults, type ChunkDescriptor } from '../src/index.js';
+import { createSizedResultSource } from '../src/host.js';
+const chunkRuntime = createWorkerRuntime<{
+  describe: { input: null; output: ChunkDescriptor };
+  take: { input: string; output: Uint8Array };
+}>({ pools: { cpu: { factory, size: 1 } } });
+const chunkSession = chunkRuntime.createScope().session('cpu');
+const sizedIterator: AsyncIterableIterator<Uint8Array> = iterateSizedResults({
+  session: chunkSession,
+  task: 'take',
+  maxChunkBytes: 1024,
+  budget: { inputBytes: 256, scratchBytes: 0 },
+  describe: (signal) =>
+    chunkSession.enqueue('describe', {
+      budget: { inputBytes: 0, scratchBytes: 0, outputBytes: 1024 },
+      signal,
+      prepare: () => ({ payload: null }),
+    }),
+  prepare: (chunk) => ({ payload: chunk.token }),
+  close: () => chunkSession.dispose(),
+});
+void sizedIterator;
+const chunkSource = createSizedResultSource({
+  maxChunkBytes: 16,
+  plan: () => ({
+    outputBytes: 16,
+    encode: () => output(new Uint8Array(16)),
+    dispose() {},
+  }),
+});
+void chunkSource;
+
+import type { MaintenanceReport, SessionGroup, ResourceCacheReport } from '../src/index.js';
+import type { ScopedCache } from '../src/host.js';
+declare const workerCache: ScopedCache;
+const report: ResourceCacheReport = {
+  hits: 1,
+  misses: 2,
+  evictions: 0,
+  keys: ['block'],
+  usedBytes: 16,
+};
+const cacheResource = workerCache.setResource('reader', {}, 16, () => {}, {
+  trim: async (target) => target,
+});
+cacheResource.report(report);
+const maintenance: Promise<MaintenanceReport> = runtime.resizePool('cpu', {
+  size: 1,
+  cacheBytes: 0,
+});
+void maintenance;
+void runtime.trim({
+  pool: 'cpu',
+  cacheBytesPerWorker: 0,
+  workersPerPool: 1,
+  reclaimSessions: false,
+});
+void runtime.setMemoryPressure('moderate');
+void admission.then((session) => {
+  const group: SessionGroup<Tasks> = scope.sessionGroup([session]);
+  const value: Promise<number> = group
+    .enqueue('ping', {
+      affinity: { keys: ['block'] },
+      budget: { inputBytes: 8, scratchBytes: 0, outputBytes: 8 },
+      prepare: () => ({ payload: 'test' }),
+    })
+    .result.then((lease) => lease.value);
+  void value;
+  group.enqueuePrepared('convert', {
+    affinity: 'block',
+    budget: { inputBytes: 16, scratchBytes: 0, outputBytes: 8 },
+    preparationScratchBytes: 0,
+    prepareAsync: async () => ({ payload: new Float64Array(2) }),
+  });
+  group.enqueue('ping', {
+    budget: { inputBytes: 8, scratchBytes: 0, outputBytes: 8 },
+    // @ts-expect-error Groups preserve task input contracts.
+    prepare: () => ({ payload: 42 }),
+  });
+});
+// @ts-expect-error Pressure signals are bounded categories.
+void runtime.setMemoryPressure('extreme');
+createWorkerRuntime({
+  pools: {
+    cpu: {
+      factory,
+      size: 4,
+      cacheBytes: 1024,
+      interactiveWorkers: 1,
+      adaptive: {
+        minWorkers: 2,
+        minCacheBytes: 128,
+        sampleMs: 1000,
+        idleMs: 30000,
+        missRatio: 0.25,
+      },
+    },
+  },
+  interactiveReserve: {
+    workers: 1,
+    activeTasks: 1,
+    preparingTasks: 1,
+    resultLeases: 1,
+    budgets: { outputBytes: 1024 },
+  },
+});

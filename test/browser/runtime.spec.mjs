@@ -4,6 +4,85 @@ test.beforeEach(async ({ page }) => {
   await page.goto('/test/browser/harness.html');
 });
 
+test('Session footprints, interactive reserves and pressure trim cross real Worker control messages', async ({
+  page,
+}) => {
+  const actual = await page.evaluate(async () => {
+    const { createWorkerRuntime, browserWorker, consumeResult } = await import('/dist/index.js');
+    const rt = createWorkerRuntime({
+      pools: {
+        cpu: {
+          factory: browserWorker('/test/fixtures/browser-worker.mjs'),
+          size: 3,
+          cacheBytes: 128,
+          interactiveWorkers: 1,
+        },
+      },
+      maxActiveTasks: 3,
+      maxResultLeases: 3,
+      interactiveReserve: { workers: 1, activeTasks: 1, resultLeases: 1 },
+    });
+    const scope = rt.createScope();
+    const options = (payload) => ({
+      budget: { inputBytes: 4096, scratchBytes: 0, outputBytes: 4096 },
+      prepare: () => ({ payload }),
+    });
+    const take = (h) => consumeResult(h, (v) => v);
+    try {
+      const a = await scope.acquireSession('cpu'),
+        b = await scope.acquireSession('cpu', { reclaimable: true, residentBytes: 64 });
+      const epochA = await take(a.enqueue('footprint', options(['block-a']))),
+        epochB = await take(b.enqueue('footprint', options(['block-b', 'block-c'])));
+      const group = scope.sessionGroup([a, b]);
+      const selected = await take(
+        group.enqueue('ping', { ...options(null), affinity: { keys: ['block-b', 'block-c'] } }),
+      );
+      let blocked;
+      try {
+        await scope.acquireSession('cpu', { mode: 'immediate' });
+      } catch (error) {
+        blocked = error.reasons.includes('interactive-reserve');
+      }
+      const interactive = await scope.acquireSession('cpu', { priority: 'interactive' });
+      await take(interactive.enqueue('ping', options(null)));
+      await interactive.dispose();
+      const report = await rt.setMemoryPressure('critical');
+      const after = {
+        cache: rt.stats.reserved.cacheBytes,
+        resident: rt.stats.reserved.residentBytes,
+        keys: rt.diagnostics().pools[0].resources[0].keys,
+        reclaim: rt.diagnostics().pools[0].reclaim,
+        resource: rt.stats.resourceCacheStats,
+      };
+      const fallback = await take(group.enqueue('ping', { ...options(null), affinity: 'block-b' }));
+      await rt.setMemoryPressure('normal');
+      return {
+        routed: selected.epoch === epochB,
+        fallback: fallback.epoch === epochA,
+        blocked,
+        reclaimed: report.workersReclaimed,
+        failures: report.failures.length,
+        after,
+        restored: rt.diagnostics().pools[0].cacheBytesPerWorker,
+      };
+    } finally {
+      await rt.dispose();
+    }
+  });
+  expect(actual.routed).toBe(true);
+  expect(actual.fallback).toBe(true);
+  expect(actual.blocked).toBe(true);
+  expect(actual.reclaimed).toBe(1);
+  expect(actual.failures).toBe(0);
+  expect(actual.restored).toBe(128);
+  expect(actual.after.cache).toBe(0);
+  expect(actual.after.resident).toBe(0);
+  expect(actual.after.keys).toEqual([]);
+  expect(actual.after.reclaim.succeeded).toBe(1);
+  expect(actual.after.reclaim.byReason.pressure).toBe(1);
+  expect(actual.after.resource).toEqual({ hits: 4, misses: 2, evictions: 1 });
+});
+
 test('budgeted preparation, remote errors and public pull helper use real Workers', async ({
   page,
 }) => {
@@ -102,7 +181,7 @@ test('budgeted preparation, remote errors and public pull helper use real Worker
     borrowed: 'bound',
     scopes: 0,
     leases: 0,
-    bytes: { inputBytes: 0, scratchBytes: 0, outputBytes: 0, cacheBytes: 0 },
+    bytes: { inputBytes: 0, scratchBytes: 0, outputBytes: 0, cacheBytes: 0, residentBytes: 0 },
   });
 });
 
@@ -656,5 +735,144 @@ test('budget protection respects occupied Workers and iterator cleanup retries e
     closedFailure: 'temporary',
     scopes: 0,
     scratch: 0,
+  });
+});
+
+test('resident leases, admitted Sessions, replica reclaim and sized chunks use real Workers', async ({
+  page,
+}) => {
+  const actual = await page.evaluate(async () => {
+    const {
+      createWorkerRuntime,
+      browserWorker,
+      consumeResult,
+      iterateSizedResults,
+      transferOwnedBuffers,
+    } = await import('/dist/index.js');
+    const rt = createWorkerRuntime({
+      pools: {
+        cpu: {
+          size: 1,
+          cacheBytes: 128,
+          factory: browserWorker('/test/fixtures/browser-worker.mjs'),
+        },
+      },
+      budgets: { residentBytes: 64 },
+    });
+    const scope = rt.createScope();
+    const options = (payload, outputBytes = 1024) => ({
+      budget: { inputBytes: 1024, scratchBytes: 0, outputBytes },
+      prepare: () => ({ payload }),
+    });
+    try {
+      const replica = await scope.acquireSession('cpu', { reclaimable: true, mode: 'immediate' });
+      await consumeResult(replica.enqueue('resource', options(null)), () => {});
+      const session = await scope.acquireSession('cpu', { timeoutMs: 5000 });
+      const resized = await consumeResult(session.enqueue('sizedOpen', options(null)), (v) => v);
+      const iterator = iterateSizedResults({
+        session,
+        task: 'sizedTake',
+        maxChunkBytes: 64,
+        budget: { inputBytes: 1024, scratchBytes: 0 },
+        describe: (signal) => session.enqueue('sizedDescribe', { ...options(null), signal }),
+        prepare: (chunk) => ({ payload: chunk.token }),
+        close: () => session.dispose(),
+      });
+      const sizes = [],
+        held = [];
+      for await (const bytes of iterator) {
+        const reservation = scope.resources.acquire({ kind: 'resident', bytes: bytes.byteLength });
+        held.push(rt.stats.reserved.residentBytes);
+        sizes.push(bytes.byteLength);
+        reservation.release();
+      }
+      await iterator.closed;
+      const retained = scope.resources.acquire({ kind: 'resident', bytes: 16 });
+      const buffer = new Uint8Array(16);
+      structuredClone(buffer, { transfer: transferOwnedBuffers(buffer) });
+      await scope.dispose();
+      return {
+        sizes,
+        held,
+        resized,
+        reclaimed: replica.reclaimed,
+        reclaimedCount: rt.stats.sessionsReclaimed,
+        workers: rt.stats.workers,
+        leases: rt.stats.leases,
+        resident: rt.stats.reserved.residentBytes,
+        released: retained.released,
+        detached: buffer.byteLength,
+        waiting: rt.diagnostics().waiting.length,
+      };
+    } finally {
+      await rt.dispose();
+    }
+  });
+  expect(actual).toEqual({
+    sizes: [16, 64, 8],
+    held: [16, 64, 8],
+    resized: 32,
+    reclaimed: true,
+    reclaimedCount: 1,
+    workers: 0,
+    leases: 0,
+    resident: 0,
+    released: true,
+    detached: 0,
+    waiting: 0,
+  });
+});
+
+test('joint resident admission, binary cache and cumulative telemetry work across real Worker replacement', async ({
+  page,
+}) => {
+  const actual = await page.evaluate(async () => {
+    const { createWorkerRuntime, browserWorker, consumeResult } = await import('/dist/index.js');
+    const rt = createWorkerRuntime({
+      pools: {
+        cpu: {
+          size: 2,
+          cacheBytes: 64,
+          factory: browserWorker('/test/fixtures/browser-worker.mjs'),
+        },
+      },
+      budgets: { residentBytes: 32 },
+    });
+    const scope = rt.createScope();
+    try {
+      const replica = await scope.acquireSession('cpu', { reclaimable: true, residentBytes: 32 });
+      const primary = await scope.acquireSession('cpu', { residentBytes: 32 });
+      const value = await consumeResult(
+        primary.enqueue('binaryCache', {
+          budget: { inputBytes: 0, scratchBytes: 0, outputBytes: 1024 },
+          prepare: () => ({ payload: null }),
+        }),
+        (v) => v,
+      );
+      const bound = rt.stats.reserved.residentBytes;
+      await primary.dispose();
+      return {
+        value,
+        reclaimed: replica.reclaimed,
+        released: replica.resident.released,
+        bound,
+        resident: rt.stats.reserved.residentBytes,
+        workers: rt.stats.workers,
+        cache: rt.stats.cacheStats,
+        pool: rt.diagnostics().pools[0].cacheStats,
+      };
+    } finally {
+      await rt.dispose();
+    }
+  });
+  expect(actual).toEqual({
+    value: { native: true, sameBuffer: true, value: 42, extra: false },
+    reclaimed: true,
+    released: true,
+    bound: 32,
+    resident: 0,
+    workers: 0,
+    cache: { hits: 1, misses: 1, evictions: 1 },
+    pool: { hits: 1, misses: 1, evictions: 1 },
   });
 });

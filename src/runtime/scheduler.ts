@@ -99,6 +99,10 @@ export class Scheduler<T extends ScheduledJob> {
       a.jobs.first!.order - b.jobs.first!.order,
   );
   private clock = 0;
+  private blocked = new Map<Bucket<T>, Set<string>>();
+  private waiters = new Map<string, Set<Bucket<T>>>();
+  private checks = 0;
+  private wakes = 0;
   constructor(
     private ageingMs: number,
     private historyLimit = 4096,
@@ -106,6 +110,47 @@ export class Scheduler<T extends ScheduledJob> {
   ) {}
   get historySize(): number {
     return this.idle.size;
+  }
+  get stats(): { blockedBuckets: number; eligibilityChecks: number; wakeups: number } {
+    return {
+      blockedBuckets: this.blocked.size,
+      eligibilityChecks: this.checks,
+      wakeups: this.wakes,
+    };
+  }
+  get nextPromotionAt(): number | undefined {
+    return this.promotions.first?.at;
+  }
+  suspend(job: T, reasons: readonly string[]): void {
+    const bucket = this.membership.get(job);
+    if (!bucket || bucket.jobs.first !== job || !reasons.length) return;
+    this.unblock(bucket);
+    this.ready.remove(bucket);
+    const keys = new Set(reasons);
+    this.blocked.set(bucket, keys);
+    for (const key of keys) {
+      let waiting = this.waiters.get(key);
+      if (!waiting) this.waiters.set(key, (waiting = new Set()));
+      waiting.add(bucket);
+    }
+  }
+  wake(key: string): void {
+    for (const bucket of [...(this.waiters.get(key) ?? [])]) {
+      this.unblock(bucket);
+      this.offer(bucket);
+      this.wakes++;
+    }
+  }
+  private unblock(bucket: Bucket<T>): void {
+    for (const key of this.blocked.get(bucket) ?? []) {
+      const waiting = this.waiters.get(key)!;
+      waiting.delete(bucket);
+      if (!waiting.size) this.waiters.delete(key);
+    }
+    this.blocked.delete(bucket);
+  }
+  private offer(bucket: Bucket<T>): void {
+    if (bucket.jobs.first && !this.blocked.has(bucket)) this.ready.add(bucket);
   }
   add(job: T): void {
     let group = this.groups.get(job.groupKey);
@@ -118,19 +163,22 @@ export class Scheduler<T extends ScheduledJob> {
       job.options.priority ?? 'foreground'
     ];
     const bucket = this.bucket(group, rank, job.laneKey ?? '');
+    const first = bucket.jobs.first;
     this.ready.remove(bucket);
     bucket.jobs.add(job);
     this.membership.set(job, bucket);
-    this.ready.add(bucket);
+    if (first !== bucket.jobs.first) this.unblock(bucket);
+    this.offer(bucket);
     if (rank && this.policy === 'ageing') this.promoteAt(job, job.enqueuedAt + this.ageingMs);
   }
   remove(job: T): void {
     const bucket = this.membership.get(job);
     if (!bucket) return;
     this.ready.remove(bucket);
+    if (bucket.jobs.first === job) this.unblock(bucket);
     bucket.jobs.remove(job);
     this.membership.delete(job);
-    if (bucket.jobs.first) this.ready.add(bucket);
+    if (bucket.jobs.first) this.offer(bucket);
     else bucket.group.buckets.delete(bucket.key);
     const event = this.events.get(job);
     if (event) this.promotions.remove(event);
@@ -159,6 +207,9 @@ export class Scheduler<T extends ScheduledJob> {
     this.events.set(job, event);
     this.promotions.add(event);
   }
+  isHead(job: T): boolean {
+    return this.membership.get(job)?.jobs.first === job;
+  }
   /** Effective rank after promotions processed by select: lower is higher priority. */
   priority(job: T): number {
     return this.membership.get(job)?.rank ?? 1;
@@ -173,15 +224,17 @@ export class Scheduler<T extends ScheduledJob> {
       this.promotions.remove(event);
       this.events.delete(event.job);
       const bucket = this.membership.get(event.job)!;
+      this.unblock(bucket);
       this.ready.remove(bucket);
       bucket.jobs.remove(event.job);
-      if (bucket.jobs.first) this.ready.add(bucket);
+      if (bucket.jobs.first) this.offer(bucket);
       else bucket.group.buckets.delete(bucket.key);
       const next = this.bucket(bucket.group, bucket.rank - 1, bucket.lane);
+      this.unblock(next);
       this.ready.remove(next);
       next.jobs.add(event.job);
       this.membership.set(event.job, next);
-      this.ready.add(next);
+      this.offer(next);
       if (next.rank) this.promoteAt(event.job, event.at + this.ageingMs);
     }
     const skipped: Bucket<T>[] = [];
@@ -191,18 +244,19 @@ export class Scheduler<T extends ScheduledJob> {
         this.ready.remove(bucket);
         skipped.push(bucket);
         const job = bucket.jobs.first!;
+        this.checks++;
         if (!eligible(job)) continue;
         if (!charge(job)) return job;
         // Update every bucket of this group before the next selection.
         for (const b of bucket.group.buckets.values()) this.ready.remove(b);
         bucket.group.served = ++this.clock;
         for (const b of bucket.group.buckets.values())
-          if (b.jobs.first && !skipped.includes(b)) this.ready.add(b);
+          if (b.jobs.first && !skipped.includes(b)) this.offer(b);
         return job;
       }
       return undefined;
     } finally {
-      for (const bucket of skipped) if (bucket.jobs.first) this.ready.add(bucket);
+      for (const bucket of skipped) this.offer(bucket);
     }
   }
   releaseScope(prefix: string): void {

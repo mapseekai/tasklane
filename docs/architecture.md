@@ -360,7 +360,7 @@ await ctx.cache.delete(key)
 
 ## 13. 协议
 
-协议版本为 5，Runtime 与 Host 必须使用同一版本。消息还携带 Worker epoch：
+协议版本为 6，Runtime 与 Host 必须使用同一版本。消息还携带 Worker epoch：
 
 ```text
 hello
@@ -374,6 +374,8 @@ cancelled
 cancel
 release-scope
 released
+cache-control
+cache-controlled
 ```
 
 握手阶段由 Worker 返回支持的任务列表，Runtime 根据任务能力进行准入。
@@ -396,6 +398,8 @@ maxScratchBytes
 progress 仅承载 4 KiB 内的小型控制数据，最多单条在途，收到 progress-ack 后才能继续发送；阻塞期间只保存最新快照。任务结束后 context 关闭。
 
 Scope 销毁按 scope/epoch 等待 released 确认，超时或清理失败会拒绝；Session 正常关闭等待 disposer，失败保留 Worker 供重试。物理 terminate 失败保持隔离和额度，通过 `retryTermination()` 重试，资源释放以物理完成确认为准。
+
+缓存控制在业务任务物理完成后执行；缩容 ACK 到达才归还全局额度，扩容先申请差额。终态与释放/控制 ACK 携带有界资源计数及 footprint 快照，供 SessionGroup 路由和可选自适应控制使用。资源预留、阻塞索引和维护边界见 [资源调度指南](resource-scheduling.md)。
 
 自定义 endpoint 应运行可信代码，并在发送前遵守协议与额度约束。接收侧先完成原生消息反序列化，再执行协议校验；进程级内存限制由运行环境提供。
 

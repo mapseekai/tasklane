@@ -74,7 +74,7 @@ Session 适合需要长期绑定同一 Worker 的运行时：
 
 ## 安装与验证
 
-当前预发布版本为 `0.1.0-beta.4`，适合业务试点接入。仓库构建和 Node 示例需要 Node.js 22+ 与 pnpm，浏览器端使用 Web Worker。
+当前开发版本为 `0.2.0-beta.1`，适合业务试点验证；发布状态以 registry 为准。仓库构建和 Node 示例需要 Node.js 22+ 与 pnpm，浏览器端使用 Web Worker。
 
 ```sh
 npm install @mapseekai/tasklane@beta
@@ -265,3 +265,7 @@ MIT
 File/Blob 可作为受约束附件传入或返回，通过任务 `blobLimits` 声明逻辑大小上限，并支持在 Worker 内按范围读取。详见 [文件与分块使用指南](docs/file-and-session.md)。
 
 通过 `scope.enqueuePrepared()` / `session.enqueuePrepared()` 可先取得额度再异步准备输入；`RuntimeError.remoteError` 保留业务错误信息；公共 `iterateResults()` 提供逐块拉取与确定性清理。用法见 [准备与消费 API](docs/api.md#异步输入准备)。
+
+## emap 资源运行时升级
+
+0.2.0-beta.1 新增常驻资源额度、Session 准入/副本回收与 footprint 组路由、交互资源预留、阻塞索引、内存压力回收、可选自适应扩缩容，以及按实际 chunk 上界准入的分块接口。原有任务 API 保持可用；Worker 协议升为 v6，主线程包与 Worker bundle 必须一起更新。见 [资源调度指南](docs/resource-scheduling.md) 和 [评估与迁移指南](docs/emap-upgrade.md)。

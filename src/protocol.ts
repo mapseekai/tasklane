@@ -1,7 +1,8 @@
 import type { Packet } from './packet.js';
 import type { ErrorCode, RemoteErrorInfo } from './errors.js';
+import type { CacheStats, ResourceCacheSnapshot } from './types.js';
 
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 export const PROTOCOL_TAG = '@mapseekai/tasklane';
 
 export interface Header {
@@ -26,12 +27,23 @@ export type RequestMessage = Header & {
   maxScratchBytes: number;
 };
 export type ToWorker =
+  | (Header & { type: 'cache-control'; id: string; limit: number; trim: boolean })
   | (Header & { type: 'hello'; cacheBytes: number; cacheEntries: number })
   | RequestMessage
   | (Header & { type: 'progress-ack'; id: string; scope: string })
   | (Header & { type: 'cancel'; id: string; scope: string })
   | (Header & { type: 'release-scope'; scope: string });
 export type FromWorker =
+  | (Header & {
+      type: 'cache-controlled';
+      id: string;
+      limit: number;
+      cacheBytes: number;
+      cacheStats?: CacheStats;
+      resourceCacheStats?: CacheStats;
+      resourceReports?: ResourceCacheSnapshot[];
+      error?: WireError;
+    })
   | (Header & { type: 'ready'; tasks: string[] })
   | (Header & { type: 'progress'; id: string; scope: string; value: unknown })
   | (Header & {
@@ -42,6 +54,9 @@ export type FromWorker =
       byteLength: number;
       workerMs: number;
       cacheBytes: number;
+      cacheStats?: CacheStats;
+      resourceCacheStats?: CacheStats;
+      resourceReports?: ResourceCacheSnapshot[];
     })
   | (Header & {
       type: 'error' | 'cancelled';
@@ -50,8 +65,19 @@ export type FromWorker =
       error: WireError;
       workerMs: number;
       cacheBytes: number;
+      cacheStats?: CacheStats;
+      resourceCacheStats?: CacheStats;
+      resourceReports?: ResourceCacheSnapshot[];
     })
-  | (Header & { type: 'released'; scope: string; cacheBytes: number; error?: WireError });
+  | (Header & {
+      type: 'released';
+      scope: string;
+      cacheBytes: number;
+      cacheStats?: CacheStats;
+      resourceCacheStats?: CacheStats;
+      resourceReports?: ResourceCacheSnapshot[];
+      error?: WireError;
+    });
 
 export function header(epoch: number): Header {
   return { tag: PROTOCOL_TAG, version: PROTOCOL_VERSION, epoch };

@@ -2,7 +2,6 @@ import { integer, RuntimeError } from './errors.js';
 
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
 const typedBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
-const typedLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'length')!.get!;
 const dataBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
 const mapSize = Object.getOwnPropertyDescriptor(Map.prototype, 'size')!.get!;
 const setSize = Object.getOwnPropertyDescriptor(Set.prototype, 'size')!.get!;
@@ -12,6 +11,49 @@ const sharedBufferBytes =
     ? undefined
     : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')!.get!;
 const regexpSource = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source')!.get!;
+
+/** Fresh native view over the same storage; never retains caller-added view properties. */
+export function snapshotBinaryView(value: ArrayBufferView): ArrayBufferView {
+  if (!ArrayBuffer.isView(value))
+    throw new RuntimeError(
+      'INVALID_ARGUMENT',
+      'Binary cache values must be typed arrays or DataView',
+    );
+  const dataView = value instanceof DataView;
+  const proto = dataView ? DataView.prototype : typedArrayPrototype;
+  const buffer = (dataView ? dataBuffer : typedBuffer).call(value);
+  const offset = Object.getOwnPropertyDescriptor(proto, 'byteOffset')!.get!.call(value) as number;
+  if (dataView)
+    return new DataView(
+      buffer,
+      offset,
+      Object.getOwnPropertyDescriptor(proto, 'byteLength')!.get!.call(value) as number,
+    );
+  // Use the intrinsic tag, not a caller-controlled constructor or Symbol.toStringTag.
+  const name = Object.getOwnPropertyDescriptor(typedArrayPrototype, Symbol.toStringTag)!.get!.call(
+    value,
+  );
+  const constructors = {
+    Int8Array,
+    Uint8Array,
+    Uint8ClampedArray,
+    Int16Array,
+    Uint16Array,
+    Int32Array,
+    Uint32Array,
+    Float32Array,
+    Float64Array,
+    BigInt64Array,
+    BigUint64Array,
+  };
+  const ctor = constructors[name as keyof typeof constructors];
+  if (!ctor) throw new RuntimeError('INVALID_ARGUMENT', 'Unsupported binary view type');
+  return new ctor(
+    buffer,
+    offset,
+    Object.getOwnPropertyDescriptor(typedArrayPrototype, 'length')!.get!.call(value) as number,
+  );
+}
 
 export interface TraversalLimits {
   maxObjects?: number;
@@ -116,11 +158,6 @@ function measure(value: unknown, limits: TraversalLimits): { binary: number; met
       // fields on other built-ins are still visited (important for resident cache values).
       if (ArrayBuffer.isView(item)) {
         if (!limits.resident) continue;
-        if (!(item instanceof DataView)) {
-          const length = typedLength.call(item) as number;
-          if (length > maxEntries - entries) fail();
-          entries += length;
-        }
         for (const key in item) {
           if (!Object.hasOwn(item, key)) continue;
           if (!(item instanceof DataView) && /^(0|[1-9][0-9]*)$/.test(key)) continue;
@@ -202,3 +239,6 @@ export function transferBuffers(
   }
   return [...buffers];
 }
+
+/** Explicit ownership-handoff spelling; ownership of external aliases remains a caller contract. */
+export const transferOwnedBuffers = transferBuffers;

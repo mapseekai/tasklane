@@ -1,3 +1,4 @@
+import type { AdmissionBlocker } from './types.js';
 /** Stable error codes are part of the public contract; messages are diagnostic. */
 export const ERROR_CODES = [
   'ABORTED',
@@ -15,6 +16,7 @@ export const ERROR_CODES = [
   'HARD_CANCEL_DENIED',
   'RESULT_RELEASED',
   'REMOTE_ERROR',
+  'CAPACITY_UNAVAILABLE',
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 
@@ -82,4 +84,18 @@ export function required<T>(value: T | undefined | null, name: string): T {
   if (value === undefined || value === null)
     throw new RuntimeError('PROTOCOL_ERROR', name + ' is missing');
   return value;
+}
+
+export class SessionAdmissionError extends RuntimeError {
+  readonly reasons: readonly AdmissionBlocker[];
+  constructor(
+    readonly pool: string,
+    reasons: readonly AdmissionBlocker[],
+  ) {
+    super(
+      'CAPACITY_UNAVAILABLE',
+      `Session capacity unavailable in pool ${pool}: ${reasons.join(', ')}`,
+    );
+    this.reasons = [...reasons];
+  }
 }

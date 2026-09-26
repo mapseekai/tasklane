@@ -4,7 +4,7 @@ import type { ResultLease, TaskHandle } from './types.js';
 
 export interface ResultIterationOptions<T> {
   /** Called once per pull, after the previous result's lease has been released. */
-  next(signal: AbortSignal): TaskHandle<T>;
+  next(signal: AbortSignal): TaskHandle<T> | null | Promise<TaskHandle<T> | null>;
   isDone(value: T): boolean;
   /** Owned Session/Scope: dispose it. Borrowed Session: close only this cursor. */
   close(): void | Promise<void>;
@@ -96,11 +96,16 @@ export function iterateResults<T>(options: ResultIterationOptions<T>): ResultIte
         submitting = submitted;
         task = undefined;
         try {
-          task = options.next(controller.signal);
-          if (ended) task.cancel(failure);
+          task = (await options.next(controller.signal)) ?? undefined;
+          if (ended) task?.cancel(failure);
         } finally {
           submitted.resolve();
           submitting = undefined;
+        }
+        if (!task) {
+          await stop();
+          if (failed) throw failure;
+          return done();
         }
         const value = await task.result;
         if (ended) {

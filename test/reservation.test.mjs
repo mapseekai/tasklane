@@ -186,5 +186,6 @@ test('cancelling a protected large request unblocks fitting work before active w
     scratchBytes: 0,
     outputBytes: 0,
     cacheBytes: 0,
+    residentBytes: 0,
   });
 });

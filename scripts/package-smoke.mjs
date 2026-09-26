@@ -42,7 +42,7 @@ serve(nodeHost(), { fail() { throw Object.assign(new Error('failed'), { name: 'D
     join(directory, 'smoke.mjs'),
     `
 import assert from 'node:assert/strict';
-import { createWorkerRuntime, transferBuffers, packetByteLength, dataByteLength, iterateResults, consumeResult } from '@mapseekai/tasklane';
+import { createWorkerRuntime, transferBuffers, packetByteLength, dataByteLength, iterateResults, consumeResult, iterateSizedResults, transferOwnedBuffers } from '@mapseekai/tasklane';
 assert.equal(packetByteLength('abcd'), 8);
 assert.equal(dataByteLength('abcd'), 8);
 import { nodeWorker } from '@mapseekai/tasklane/node';
@@ -64,6 +64,27 @@ try {
  const cleanup = iterateResults({ next() { throw Error('unexpected pull'); }, isDone: () => false, close() { if (++closes === 1) throw Error('temporary close'); } });
  await assert.rejects(cleanup.dispose(), /temporary close/); await cleanup.retryCleanup();
  await assert.rejects(cleanup.closed, /temporary close/); assert.equal(closes, 2);
+ const owner = rt.createScope('resident-smoke');
+ const session = await owner.acquireSession('cpu', { mode: 'immediate', reclaimable: true, residentBytes: 8 });
+ assert.equal(session.state, 'bound'); assert.equal(typeof iterateSizedResults, 'function');
+ const input = new Float64Array([5]);
+ const output = await session.enqueue('double', { budget: { inputBytes: 8, scratchBytes: 0, outputBytes: 8 }, prepare: () => ({ payload: input, transfer: transferOwnedBuffers(input) }) }).result;
+ const allocation = session.resident;
+ assert.equal(allocation.bytes, 8);
+ assert.equal(output.value[0], 10); output.release(); allocation.resize(16);
+ assert.equal(rt.stats.reserved.residentBytes, 16);
+ assert.equal(rt.diagnostics().pools[0].boundSessions, 1);
+ const group = owner.sessionGroup([session]);
+ await consumeResult(group.enqueue('double', { budget: { inputBytes: 8, scratchBytes: 0, outputBytes: 8 }, affinity: 'source/block', prepare: () => ({ payload: new Float64Array([6]) }) }), value => assert.equal(value[0], 12));
+ assert.deepEqual((await rt.resizePool('cpu', { size: 1, cacheBytes: 0 })).failures, []);
+ assert.deepEqual((await rt.trim({ workersPerPool: 1, reclaimSessions: false })).failures, []);
+ const reclaimed = await rt.setMemoryPressure('critical');
+ assert.equal(reclaimed.workersReclaimed, 1);
+ assert.equal(rt.stats.reclaim.byReason.pressure, 1);
+ await rt.setMemoryPressure('normal');
+ await owner.dispose(); assert.equal(allocation.released, true);
+ assert.equal(rt.stats.reserved.residentBytes, 0);
+
 } finally { await rt.dispose(); }
 assert.equal(rt.stats.workers, 0);
 import { createLoopback } from '@mapseekai/tasklane/testing';

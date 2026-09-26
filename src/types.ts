@@ -41,7 +41,34 @@ export interface TaskBudget {
 export interface RuntimeBudgets extends TaskBudget {
   /** Reservations for all resident worker caches, not just currently used entries. */
   cacheBytes: number;
+  /** Caller-declared lifetime budget, independent of task/cache ceilings. Default 128 MiB. */
+  residentBytes?: number;
 }
+
+export interface ResourceLease {
+  readonly bytes: number;
+  readonly released: boolean;
+  /** Atomic, exact resize. Failure leaves the previous reservation intact. */
+  resize(bytes: number): void;
+  release(): void;
+}
+export interface ResourceOptions {
+  kind: 'resident';
+  bytes: number;
+  priority?: Priority;
+}
+export interface ResourceReservations {
+  acquire(options: ResourceOptions): ResourceLease;
+}
+export interface SessionOptions {
+  /** Resource admission class; task priority defaults to this class. */
+  priority?: Priority;
+  /** Only idle Sessions without pending tasks or held results may be reclaimed. */
+  reclaimable?: boolean;
+  /** Lower values are reclaimed first, then least recently used. Default 0. */
+  reclaimPriority?: number;
+}
+export type TaskAffinity = string | { keys: readonly string[] };
 
 export interface PreparedInput<T> {
   payload: T;
@@ -60,7 +87,7 @@ export interface TaskOptions<Input> {
   /** Fairness is per scope + group, not merely per task. */
   group?: string;
   /** Soft, bounded cache affinity. Use a Session for required affinity. */
-  affinity?: string;
+  affinity?: TaskAffinity;
   cancellation?: Cancellation;
   signal?: AbortSignal;
   queueTimeoutMs?: number;
@@ -118,16 +145,71 @@ export interface TaskHandle<T> {
 export interface PoolOptions {
   factory: () => WorkerEndpoint;
   size: number;
-  /** Fixed reservation per live worker. Zero means no persistent cache storage. */
+  /** Per-Worker cache hard bound and default reservation. Zero disables persistent storage. */
   cacheBytes?: number;
   cacheEntries?: number;
   /** Hard cancellation may discard opportunistic caches. Sessions always have exclusive slots. */
   allowHardCancel?: boolean;
   /** A pooled, unpinned idle worker is reclaimed after this interval; 0 disables idle expiry. */
   idleTimeoutMs?: number;
+  /** Worker slots unavailable to non-interactive admissions. */
+  interactiveWorkers?: number;
+  /** Opt-in feedback controller. size/cacheBytes remain hard upper bounds. */
+  adaptive?: AdaptivePoolOptions;
+}
+
+export interface AdaptivePoolOptions {
+  minWorkers?: number;
+  minCacheBytes?: number;
+  sampleMs?: number;
+  idleMs?: number;
+  missRatio?: number;
+}
+export interface InteractiveReserve {
+  workers?: number;
+  activeTasks?: number;
+  preparingTasks?: number;
+  resultLeases?: number;
+  budgets?: Partial<RuntimeBudgets>;
+}
+export interface PoolSizing {
+  size?: number;
+  cacheBytes?: number;
+}
+export type MemoryPressure = 'normal' | 'moderate' | 'critical';
+export interface TrimOptions {
+  pool?: string;
+  cacheBytesPerWorker?: number;
+  workersPerPool?: number;
+  reclaimSessions?: boolean;
+}
+export interface MaintenanceReport {
+  workersReclaimed: number;
+  cacheBytesReleased: number;
+  failures: readonly { pool: string; worker: number; message: string }[];
+}
+export type ReclaimReason = 'capacity' | 'resident' | 'pressure' | 'resize' | 'adaptive';
+export interface ReclaimStats {
+  attempts: number;
+  succeeded: number;
+  failed: number;
+  byReason: Record<ReclaimReason, number>;
+}
+/** Absolute counters and a complete replacement snapshot of a reader's current cached keys. */
+export interface ResourceCacheReport extends CacheStats {
+  usedBytes: number;
+  keys: readonly string[];
+}
+export interface ResourceCacheSnapshot extends ResourceCacheReport {
+  id: string;
+  scope: string;
+  session: string;
+  resource: string;
+  reservedBytes: number;
 }
 
 export interface RuntimeOptions {
+  interactiveReserve?: InteractiveReserve;
   pools: Record<string, PoolOptions>;
   maxWorkers?: number;
   maxActiveTasks?: number;
@@ -136,6 +218,8 @@ export interface RuntimeOptions {
   maxQueuedTasks?: number;
   /** Bounds held leases plus admitted work, including zero-binary-byte results. */
   maxResultLeases?: number;
+  /** Bounds resident resource handles, including zero-byte reservations. Default 4096. */
+  maxResourceLeases?: number;
   /** Maximum simultaneously open scopes, including children. */
   maxScopes?: number;
   budgets?: Partial<RuntimeBudgets>;
@@ -153,7 +237,17 @@ export interface RuntimeOptions {
   onDiagnostic?: (error: RuntimeError) => void;
 }
 
+/** Cumulative CacheStore lookups and automatic LRU evictions; opaque resource internals are excluded. */
+export interface CacheStats {
+  hits: number;
+  misses: number;
+  evictions: number;
+}
 export interface RuntimeStats {
+  resourceCacheStats: Readonly<CacheStats>;
+  reclaim: Readonly<ReclaimStats>;
+  scheduler: { blockedBuckets: number; eligibilityChecks: number; wakeups: number };
+  cacheStats: Readonly<CacheStats>;
   queued: number;
   active: number;
   preparing: number;
@@ -163,10 +257,12 @@ export interface RuntimeStats {
   workers: number;
   closingWorkers: number;
   leases: number;
+  resourceLeases: number;
+  sessionsReclaimed: number;
   scopes: number;
   quarantinedWorkers: number;
-  reserved: RuntimeBudgets;
-  peakReserved: RuntimeBudgets;
+  reserved: Required<RuntimeBudgets>;
+  peakReserved: Required<RuntimeBudgets>;
   cacheUsedBytes: number;
   completed: number;
   cancelled: number;
@@ -176,4 +272,83 @@ export interface RuntimeStats {
   inputBytes: number;
   outputBytes: number;
   observerErrors: number;
+}
+
+export type AdmissionBlocker =
+  | 'interactive-reserve'
+  | 'maintenance'
+  | 'pool-capacity'
+  | 'worker-capacity'
+  | 'cache-budget'
+  | 'resident-budget'
+  | 'resource-leases'
+  | 'worker-closing'
+  | 'session-busy'
+  | 'session-starting'
+  | 'session-priority'
+  | 'session-lost'
+  | 'scope-release'
+  | 'preparation-window'
+  | 'active-tasks'
+  | 'result-leases'
+  | 'input-budget'
+  | 'scratch-budget'
+  | 'output-budget'
+  | 'budget-reservation'
+  | 'lane-order'
+  | 'preparing'
+  | 'scheduler-turn';
+export interface SessionAdmissionOptions extends SessionOptions {
+  /** Reserve lifetime bytes together with the Worker; exposed as session.resident. */
+  residentBytes?: number;
+  /** Immediate reserves available capacity or rejects; wait queues until capacity is available. */
+  mode?: 'immediate' | 'wait';
+  signal?: AbortSignal;
+  /** Includes waiting and startup; defaults to queueTimeoutMs. */
+  timeoutMs?: number;
+}
+export interface PoolDiagnostics {
+  readonly resourceCacheStats: Readonly<CacheStats>;
+  readonly resources: readonly ResourceCacheSnapshot[];
+  readonly reclaim: Readonly<ReclaimStats>;
+  readonly maxCapacity: number;
+  readonly maxCacheBytesPerWorker: number;
+  readonly adaptive: boolean;
+  readonly cacheStats: Readonly<CacheStats>;
+  readonly name: string;
+  readonly capacity: number;
+  readonly workers: number;
+  readonly starting: number;
+  readonly running: number;
+  readonly idle: number;
+  readonly sessionIdle: number;
+  readonly closing: number;
+  readonly quarantined: number;
+  readonly boundSessions: number;
+  readonly reclaimableSessions: number;
+  readonly waitingSessions: number;
+  readonly queuedTasks: number;
+  readonly cacheBytesPerWorker: number;
+  readonly cacheReservedBytes: number;
+  readonly cacheUsedBytes: number;
+  readonly blockers: readonly AdmissionBlocker[];
+}
+export interface RuntimeDiagnostics {
+  readonly memoryPressure: MemoryPressure;
+  readonly limits: Readonly<RuntimeBudgets> & {
+    readonly maxWorkers: number;
+    readonly maxActiveTasks: number;
+    readonly maxPreparingTasks: number;
+    readonly maxResultLeases: number;
+    readonly maxQueuedTasks: number;
+    readonly maxResourceLeases: number;
+  };
+  readonly pools: readonly PoolDiagnostics[];
+  readonly waiting: readonly {
+    readonly id: string;
+    readonly pool: string;
+    readonly session?: string;
+    readonly kind: 'task' | 'session';
+    readonly reasons: readonly AdmissionBlocker[];
+  }[];
 }

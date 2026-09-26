@@ -3,20 +3,48 @@ export {
   binaryByteLength,
   dataByteLength,
   transferBuffers,
+  transferOwnedBuffers,
   type TraversalLimits,
 } from './binary.js';
-export { RuntimeError, type ErrorCode, type RemoteErrorInfo, type ErrorDetail } from './errors.js';
+export {
+  RuntimeError,
+  SessionAdmissionError,
+  type ErrorCode,
+  type RemoteErrorInfo,
+  type ErrorDetail,
+} from './errors.js';
 export {
   createWorkerRuntime,
   RuntimeScope,
   WorkerRuntime,
   WorkerSession,
+  SessionGroup,
 } from './runtime/runtime.js';
 export type {
+  AdaptivePoolOptions,
+  InteractiveReserve,
+  MaintenanceReport,
+  MemoryPressure,
+  PoolSizing,
+  TrimOptions,
+  ReclaimReason,
+  ReclaimStats,
+  ResourceCacheReport,
+  ResourceCacheSnapshot,
+  CacheStats,
+  AdmissionBlocker,
+  RuntimeDiagnostics,
+  PoolDiagnostics,
+  SessionAdmissionOptions,
   Cancellation,
   Catalog,
   MessagePortLike,
   PoolOptions,
+  ResourceLease,
+  ResourceOptions,
+  ResourceReservations,
+  SessionOptions,
+  TaskAffinity,
   PreparedInput,
   PreparedTaskOptions,
   SessionPreparedTaskOptions,
@@ -57,3 +85,10 @@ export {
   type ResultIterator,
   type ResultIterationOptions,
 } from './iterate-results.js';
+
+export {
+  iterateSizedResults,
+  type SizedResultOptions,
+  type ChunkDescriptor,
+  type PendingChunk,
+} from './sized-results.js';

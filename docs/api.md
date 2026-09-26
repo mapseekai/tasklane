@@ -60,7 +60,7 @@ interface PoolOptions {
 }
 ```
 
-Pool 的 `cacheBytes` 默认 0，`cacheEntries` 默认 4096，`allowHardCancel` 默认 false。`idleTimeoutMs` 默认 30000，设置 0 禁用空闲过期；Session 持续持有绑定的 Worker，直至关闭或 Worker 失效。每个存活 Worker 都预留该 Pool 的完整 cacheBytes。
+Pool 的 `cacheBytes` 默认 0，`cacheEntries` 默认 4096，`allowHardCancel` 默认 false。`idleTimeoutMs` 默认 30000，设置 0 禁用空闲过期；Session 持续持有绑定的 Worker，直至关闭或 Worker 失效。默认每个存活 Worker 都预留完整 cacheBytes；启用 resize/pressure/adaptive 后按已确认的当前缓存上限计账，构造配置保持硬上限。
 
 适用方式：
 
@@ -435,6 +435,7 @@ checkpoint 会让出真实事件循环以接收取消消息；完成后调用会
 ```ts
 ctx.cache.get(key)
 ctx.cache.set(key, value, bytes)
+ctx.cache.setBinary(key, typedArrayOrDataView)
 ctx.cache.setPinned(key, value, bytes)
 await ctx.cache.delete(key)
 ```
@@ -568,7 +569,7 @@ await runtime.retryTermination(); // 重试物理终止失败的隔离 Worker
 await runtime.disposeWithin(5000); // 限制等待时间；超时后后台清理继续进行
 ```
 
-`scope.disposeWithin(ms)` 同样只约束等待时间，Session 使用 dispose。协议 v5 的 request 携带 Packet payload、maxOutputBytes、maxOutputBlobBytes 和 maxScratchBytes；progress 使用 ACK，Scope 释放也需要 ACK。
+`scope.disposeWithin(ms)` 同样只约束等待时间，Session 使用 dispose。协议 v6 的 request 携带 Packet payload、maxOutputBytes、maxOutputBlobBytes 和 maxScratchBytes；progress、Scope 释放和 cache-control 均使用 ACK。主线程包与 Worker bundle 必须同步更新。
 
 详见 [资源与调度契约](resources.md)，包括元数据限制、`budgetWaitMs`、`releaseTimeoutMs`、进度 ACK、Scope 释放确认、`withScope`、`disposeWithin`、`resourceDiagnostics` 和 `retryTermination`。
 
@@ -652,3 +653,25 @@ await chunks.closed;
 `iterateResults<T>(ResultIterationOptions<T>)` 返回 `ResultIterator<T>`，支持 AsyncIterableIterator、dispose()、retryCleanup() 与 closed。isDone 为 true 的结束标记在内部释放；其他值逐块交给消费者。下一次 next、return、dispose 或 AbortSignal 都会结束当前租约。并发 next 以 INVALID_ARGUMENT 拒绝，消费者逐次请求即可保持单块在途。
 
 break 和消费者异常通过迭代器 return 清理；手工 next 使用 finally + dispose。终止时取消当前请求并等待 settled，再调用 close。closed 保存首次清理尝试的结果，失败可通过该 Promise 观察。显式调用 retryCleanup() 可重试失败的 close；重试期间 dispose() 与其他 retryCleanup() 共用进行中的尝试，成功后的调用直接完成。重试只执行资源清理，迭代保持结束；close 应支持部分完成后的重复调用。原 closed Promise 保留首次结果，以 retryCleanup() 返回值确认恢复。消费者保留块引用时需接管其内存预算。
+
+## 0.2 资源与准入 API
+
+- `runtime.resources.acquire({ kind: 'resident', bytes })` / `scope.resources.acquire(...)` / `session.resources.acquire(...)` 返回 ResourceLease（bytes、released、resize、release）。
+- `scope.acquireSession(pool, { mode?, timeoutMs?, signal?, reclaimable?, reclaimPriority?, residentBytes?, priority? })` 联合预留 Worker 和可选常驻额度；`session.resident` 返回该 ResourceLease。省略 residentBytes 时不创建租约；`scope.session(pool, options?)` 保留惰性行为。
+- `session.reclaimed` 标识可回收 Session 的关闭原因。
+- `runtime.diagnostics()` 返回 RuntimeDiagnostics；即时容量错误为 SessionAdmissionError（CAPACITY_UNAVAILABLE）。
+- `TaskOptions.affinity` 支持字符串或 `{ keys: readonly string[] }`。
+- `ctx.cache.setResource` 返回 CacheResourceLease（bytes、released、resize、异步 release）。
+- `ctx.cache.setBinary(key, view)` 保存共享 backing store 的新原生视图，保留类型、offset、length，丢弃附加属性和子类行为，按完整 backing store 计费；无索引枚举或数据复制。需要保存附加字段时使用 set/setPinned。
+- `runtime.stats.cacheStats` / `runtime.diagnostics().pools[i].cacheStats` 提供累计 hits/misses/evictions；仅统计 CacheStore，Worker 更换后累计值保留，任务响应和释放/控制 ACK 更新快照。
+- `scope.sessionGroup(sessions)` 借用同源、同 Scope/Pool/准入类别的已绑定 Session；enqueue/enqueuePrepared 根据资源 footprint 选择空闲成员。
+- `CacheResourceLease.report(snapshot)` 上报资源内部 hits/misses/evictions、usedBytes 和完整 keys；setResource 第五参数可提供异步 trim 回调。
+- `interactiveReserve` 和 Pool.interactiveWorkers 预留交互任务的数量/字节资源；默认 0。资源和 Session 的 priority 默认 foreground。
+- `runtime.resizePool(name, { size?, cacheBytes? })`、`trim({ pool?, cacheBytesPerWorker?, workersPerPool?, reclaimSessions? })`、`setMemoryPressure('normal' | 'moderate' | 'critical')` 返回 Promise<MaintenanceReport>，包含成功回收数量、归还 cache 额度与逐 Worker failures。并发维护调用应串行等待。
+- Pool.adaptive 可配置 minWorkers/minCacheBytes/sampleMs/idleMs/missRatio；省略时不自动调整。
+- `stats.resourceCacheStats`、逐池 resources/reclaim 和 `stats.scheduler` 提供 reader 缓存与回收/阻塞索引诊断。默认值、上限和完整示例见 [资源调度指南](resource-scheduling.md)。
+- `ctx.outputLimit` 提供当前任务已准入输出字节上界。
+- 主入口导出 `iterateSizedResults`、`SizedResultOptions`、`ChunkDescriptor`；host 入口导出 `createSizedResultSource` 和对应类型。
+- `transferOwnedBuffers` 为 `transferBuffers` 的明确所有权别名。
+
+详细参数上限、释放顺序、失败重试与完整迁移示例见 [emap 升级指南](emap-upgrade.md)。

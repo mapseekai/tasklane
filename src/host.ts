@@ -1,7 +1,8 @@
 import { encodeError as wireError } from './remote-error.js';
 import { validateProgress } from './progress.js';
 import { yieldTask } from './yield.js';
-import { decodePacket, encodePacket, packetBytes, validateBlobTransfers } from './packet.js';
+import { decodePacket, packetBytes, packetBlobBytes, validateBlobTransfers } from './packet.js';
+import { encodeOutput } from './prepared-output.js';
 import { ScratchArena } from './resources/scratch.js';
 import { aborted, integer, required, RuntimeError } from './errors.js';
 import {
@@ -15,7 +16,13 @@ import { CacheStore, type ScopedCache } from './resources/cache.js';
 import type { Catalog, MessagePortLike, TaskMap } from './types.js';
 
 export { browserHost } from './adapters/browser.js';
-export type { ScopedCache } from './resources/cache.js';
+export type { ScopedCache, CacheResourceLease, CacheResourceOptions } from './resources/cache.js';
+export {
+  createSizedResultSource,
+  type SizedResultPlan,
+  type SizedResultSource,
+  type SizedResultSourceOptions,
+} from './sized-source.js';
 
 export interface TaskOutput<T> {
   value: T;
@@ -26,6 +33,8 @@ export function output<T>(value: T, transfer: readonly Transferable[] = []): Tas
 }
 export interface HostContext {
   readonly signal: AbortSignal;
+  /** Reserved packet bytes for this task's output, available before allocating a chunk. */
+  readonly outputLimit: number;
   readonly scopeId: string;
   readonly sessionId?: string;
   readonly epoch: number;
@@ -56,23 +65,74 @@ export function serve<T extends Catalog<T> = TaskMap>(
     | { request: RequestMessage; controller: AbortController; acknowledge(): void }
     | undefined;
   let disposed = false;
+  let maintaining = false,
+    releasing = 0;
+  let control: Extract<ToWorker, { type: 'cache-control' }> | undefined;
   const releaseAfter = new Set<string>();
   const send = (message: FromWorker, transfer?: readonly Transferable[]) =>
     port.postMessage(message, transfer);
-  const release = (scope: string) => {
+  const metrics = () => ({
+    cacheStats: cache?.stats,
+    resourceCacheStats: cache?.resourceStats,
+    resourceReports: cache?.reports,
+  });
+  const flushControl = () => {
+    if (!control || maintaining || active || releasing || disposed) return;
+    const command = control;
+    control = undefined;
+    maintaining = true;
     void (async () => {
+      let error;
+      try {
+        integer(command.limit, 'cache limit');
+        if (typeof command.trim !== 'boolean')
+          throw new RuntimeError('INVALID_ARGUMENT', 'Invalid cache control');
+        if (command.trim) await required(cache, 'Host cache').trim(command.limit);
+        required(cache, 'Host cache').resize(command.limit);
+      } catch (cause) {
+        error = wireError(cause);
+      }
+      maintaining = false;
+      for (const scope of releaseAfter) {
+        releaseAfter.delete(scope);
+        release(scope);
+      }
+      if (!disposed)
+        send({
+          ...header(epoch),
+          type: 'cache-controlled',
+          id: command.id,
+          limit: required(cache, 'Host cache').limit,
+          cacheBytes: cache?.bytes ?? 0,
+          ...metrics(),
+          error,
+        });
+      flushControl();
+    })().catch(() => {
+      disposed = true;
+      maintaining = false;
+    });
+  };
+  const release = (scope: string) => {
+    releasing++;
+    void (async () => {
+      let error;
       try {
         await cache?.release(scope);
-        send({ ...header(epoch), type: 'released', scope, cacheBytes: cache?.bytes ?? 0 });
-      } catch (error) {
+      } catch (cause) {
+        error = wireError(cause);
+      }
+      releasing--;
+      if (!disposed)
         send({
           ...header(epoch),
           type: 'released',
           scope,
           cacheBytes: cache?.bytes ?? 0,
-          error: wireError(error),
+          ...metrics(),
+          error,
         });
-      }
+      flushControl();
     })().catch(() => {
       disposed = true;
     });
@@ -138,6 +198,7 @@ export function serve<T extends Catalog<T> = TaskMap>(
       const context: HostContext = {
         scratch,
         signal: controller.signal,
+        outputLimit: request.maxOutputBytes,
         scopeId: request.scope,
         sessionId: request.session,
         epoch,
@@ -164,9 +225,12 @@ export function serve<T extends Catalog<T> = TaskMap>(
         throw new RuntimeError('PROTOCOL_ERROR', 'Handler must return output(value, transfer)');
       }
       validateBlobTransfers(result.transfer);
-      const value = encodePacket(result.value, request.maxOutputBytes, request.maxOutputBlobBytes);
+      const value = encodeOutput(result, request.maxOutputBytes, request.maxOutputBlobBytes);
       const byteLength = packetBytes(value);
-      if (byteLength > request.maxOutputBytes) {
+      if (
+        byteLength > request.maxOutputBytes ||
+        packetBlobBytes(value) > request.maxOutputBlobBytes
+      ) {
         throw new RuntimeError('BUDGET_EXCEEDED', 'Result exceeds reserved outputBytes');
       }
       if (!disposed) {
@@ -180,6 +244,7 @@ export function serve<T extends Catalog<T> = TaskMap>(
             byteLength,
             workerMs: performance.now() - started,
             cacheBytes: required(cache, 'Host cache').bytes,
+            ...metrics(),
           },
           result.transfer,
         );
@@ -194,6 +259,7 @@ export function serve<T extends Catalog<T> = TaskMap>(
           error: wireError(controller.signal.aborted ? aborted(controller.signal.reason) : error),
           workerMs: performance.now() - started,
           cacheBytes: cache?.bytes ?? 0,
+          ...metrics(),
         });
       }
     } finally {
@@ -204,6 +270,7 @@ export function serve<T extends Catalog<T> = TaskMap>(
       clearTimeout(progressTimer);
       active = undefined;
       if (releaseAfter.delete(request.scope) && !disposed) release(request.scope);
+      flushControl();
     }
   };
   const unsubscribe = port.onMessage((raw) => {
@@ -222,6 +289,12 @@ export function serve<T extends Catalog<T> = TaskMap>(
       return;
     }
     if (!epoch || message.epoch !== epoch) return;
+    if (message.type === 'cache-control') {
+      if (control || maintaining) return; // Runtime permits one bounded control per Worker.
+      control = message;
+      flushControl();
+      return;
+    }
     if (message.type === 'progress-ack') {
       if (active?.request.id === message.id && active.request.scope === message.scope)
         try {
@@ -240,14 +313,14 @@ export function serve<T extends Catalog<T> = TaskMap>(
       return;
     }
     if (message.type === 'release-scope') {
-      if (active?.request.scope === message.scope) {
+      if (active?.request.scope === message.scope || maintaining) {
         releaseAfter.add(message.scope);
-        active.controller.abort(aborted());
+        if (active?.request.scope === message.scope) active.controller.abort(aborted());
       } else release(message.scope);
       return;
     }
     if (message.type !== 'request') return;
-    if (active) {
+    if (active || maintaining || control || releasing) {
       // A correct runtime never sends a second physical request before the first terminal reply.
       send({
         ...header(epoch),

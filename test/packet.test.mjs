@@ -65,6 +65,119 @@ test('codec rejects wide arrays before touching entries and never invokes access
   assert.equal(calls, 0);
 });
 
+test('dense arrays fit compact metadata budgets and preserve exact roundtrip values', () => {
+  const numbers = Array.from({ length: 100_000 }, (_, i) => i);
+  const pairs = Array.from({ length: 50_000 }, (_, i) => [i, -i]);
+  for (const [value, limit] of [
+    [numbers, 1_200_000],
+    [pairs, 6_500_000],
+  ]) {
+    const packet = encodePacket(value, limit);
+    const bytes = packetBytes(packet);
+    assert.ok(bytes <= limit);
+    assert.deepEqual(decodePacket(structuredClone(packet)), value);
+    assert.doesNotThrow(() => encodePacket(value, bytes));
+    assert.throws(() => encodePacket(value, bytes - 1), { code: 'BUDGET_EXCEEDED' });
+  }
+});
+
+test('array prefixes preserve holes, cycles, aliases, named properties and special scalars', () => {
+  const child = [-0, NaN, Infinity, -Infinity, undefined, 9n, ['r', 0], ['n', 'NaN']];
+  const value = [child, child];
+  value.push(value);
+  value.length = 8;
+  value[5] = undefined;
+  value[6] = child;
+  value.extra = child;
+  value['01'] = 'named';
+  Object.defineProperty(value, '__proto__', { enumerable: true, value: child });
+  Object.defineProperty(value, '4', { enumerable: false, value: 'hidden' });
+  const packet = encodePacket(value);
+  for (let i = 0; i < 2; i++) {
+    const copy = decodePacket(structuredClone(packet));
+    assert.equal(copy.length, 8);
+    assert.deepEqual(copy[0], child);
+    assert.equal(copy[0], copy[1]);
+    assert.equal(copy[2], copy);
+    assert.equal(copy[6], copy[0]);
+    assert.equal(copy.extra, copy[0]);
+    assert.equal(copy.__proto__, copy[0]);
+    assert.equal(Object.getPrototypeOf(copy), Array.prototype);
+    assert.equal(copy['01'], 'named');
+    assert.deepEqual(
+      [3, 4, 7].map((k) => Object.hasOwn(copy, k)),
+      [false, false, false],
+    );
+    assert.equal(Object.hasOwn(copy, 5), true);
+    copy[0][0] = 42; // A previous decode must not mutate the encoded snapshot.
+  }
+  const inherited = Object.create(Array.prototype, {
+    0: {
+      enumerable: true,
+      get() {
+        assert.fail('inherited getter invoked');
+      },
+    },
+  });
+  const sparse = new Array(3);
+  Object.setPrototypeOf(sparse, inherited);
+  const copy = decodePacket(encodePacket(sparse));
+  assert.equal(copy.length, 3);
+  assert.deepEqual(Object.keys(copy), []);
+});
+
+test('compact arrays reject getters and retain object and traversal limits', () => {
+  for (const key of ['0', '1', 'extra']) {
+    const value = [1, 2];
+    Object.defineProperty(value, key, {
+      enumerable: true,
+      get() {
+        assert.fail('own getter invoked');
+      },
+    });
+    assert.throws(() => encodePacket(value), { code: 'PROTOCOL_ERROR' });
+  }
+  assert.throws(() => encodePacket(new Array(1_000_000)), { code: 'BUDGET_EXCEEDED' });
+  assert.throws(() => encodePacket(Array.from({ length: 100_000 }, () => [1, 2])), {
+    code: 'BUDGET_EXCEEDED',
+  });
+});
+
+test('decoder bounds compact array entries before expanding them', () => {
+  for (const items of [null, {}, 'invalid', [1, 2]]) {
+    const packet = {
+      kind: 'graph',
+      buffers: [],
+      blobs: [],
+      metadata: JSON.stringify({ root: ['r', 0], nodes: [{ type: 'array', length: 1, items }] }),
+    };
+    assert.throws(() => decodePacket(packet), { code: 'PROTOCOL_ERROR' });
+  }
+  const packet = encodePacket([0]);
+  packet.metadata = JSON.stringify({
+    root: ['r', 0],
+    nodes: Array.from({ length: 2 }, () => ({
+      type: 'array',
+      length: 500_001,
+      items: Array(500_001).fill(0),
+    })),
+  });
+  assert.throws(() => decodePacket(packet), { code: 'PROTOCOL_ERROR' });
+});
+
+test('arrays retain nested buffer ownership and aliases through transfer', () => {
+  const buffer = new ArrayBuffer(16);
+  const view = new Float64Array(buffer);
+  view.set([1.5, -0]);
+  const value = [view, view, { buffer }];
+  const packet = structuredClone(encodePacket(value), { transfer: [buffer] });
+  assert.equal(buffer.byteLength, 0);
+  const copy = decodePacket(packet);
+  assert.equal(copy[0], copy[1]);
+  assert.equal(copy[0].buffer, copy[2].buffer);
+  assert.deepEqual([...copy[0]], [1.5, -0]);
+});
+
 test('result receipt only validates wire sizes; decode is lazy and failure releases credits', () => {
   const packet = { kind: 'graph', metadata: 'invalid json', buffers: [], blobs: [] };
   assert.equal(packetBytes(packet), 24);

@@ -6,6 +6,7 @@ import { serve, output } from '../dist/host.js';
 import { deferred } from '../dist/runtime/deferred.js';
 import { Scheduler } from '../dist/runtime/scheduler.js';
 import { sleep, until } from './helpers.mjs';
+import { setImmediate } from 'node:timers';
 
 function setup(t, extra = {}) {
   const gate = deferred();
@@ -66,6 +67,85 @@ function setup(t, extra = {}) {
   return { rt, scope, gate, order, options, prepared };
 }
 const take = (handle) => consumeResult(handle, () => {});
+
+for (const earlyBy of [0, 0.5]) {
+  test(`budget reservation survives truncated timers firing ${earlyBy}ms early`, async (t) => {
+    let now = 0,
+      serial = 0;
+    const timers = new Map();
+    const flush = () => new Promise(setImmediate);
+    t.mock.method(performance, 'now', () => now);
+    t.mock.method(globalThis, 'setTimeout', (callback, delay = 0, ...args) => {
+      const id = ++serial;
+      timers.set(id, {
+        at: now + Math.max(1, Math.trunc(delay)) - earlyBy,
+        run: () => callback(...args),
+      });
+      return id;
+    });
+    t.mock.method(globalThis, 'clearTimeout', (id) => timers.delete(id));
+    const { rt, scope, gate, options } = setup(t, { budgetWaitMs: 10 });
+    await Promise.all(
+      ['holder', 'large', 'small'].map((pool) => take(scope.enqueue('ping', options(pool, 0)))),
+    );
+    const holder = scope.enqueue('hold', options('holder', 60));
+    await flush();
+    const large = scope.enqueue('ping', options('large', 80));
+    now = 0.25; // The first drain is between timer ticks, after enqueue.
+    await flush();
+    for (;;) {
+      const next = [...timers]
+        .filter(([, timer]) => timer.at <= 20)
+        .sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next) break;
+      now = next[1].at;
+      timers.delete(next[0]);
+      next[1].run();
+      await flush();
+    }
+    now = 20;
+    const small = scope.enqueue('ping', options('small', 20));
+    await flush();
+    assert.equal(small.state, 'queued');
+    assert.ok(
+      rt
+        .diagnostics()
+        .waiting.find((j) => j.id === small.id)
+        .reasons.includes('budget-reservation'),
+    );
+    gate.resolve();
+    await Promise.all([holder, large, small].map(take));
+  });
+}
+
+for (const policy of ['strict', 'ageing']) {
+  test(`${policy}: class budget shortages protect large requests without blocking interactive reserves`, async (t) => {
+    const { rt, scope, gate, options } = setup(t, {
+      interactiveReserve: { budgets: { scratchBytes: 40 } },
+      priorityPolicy: policy,
+      ageingMs: 10,
+    });
+    const running = scope.enqueue('hold', options('holder', 20));
+    await until(() => running.state === 'running');
+    const large = scope.enqueue('ping', options('large', 60));
+    await sleep(30); // Both budget protection and ageing have become effective.
+    const small = scope.enqueue('ping', options('small', 20));
+    await sleep(30); // The blocked foreground head also ages to the interactive rank.
+    assert.equal(small.state, 'queued');
+    assert.ok(
+      rt
+        .diagnostics()
+        .waiting.some((r) => r.id === small.id && r.reasons.includes('budget-reservation')),
+    );
+    await take(
+      scope.enqueue('ping', { ...options('small', 20, 'interactive'), queueTimeoutMs: 200 }),
+    );
+    assert.equal(large.state, 'queued');
+    gate.resolve();
+    await Promise.all([running, large, small].map(take));
+    assert.equal(rt.stats.reserved.scratchBytes, 0);
+  });
+}
 
 for (const occupied of ['busy', 'session']) {
   test(`prepared task behind a ${occupied} slot does not reserve away another pool's budget`, async (t) => {

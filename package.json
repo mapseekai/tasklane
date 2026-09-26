@@ -1,6 +1,6 @@
 {
   "name": "@mapseekai/tasklane",
-  "version": "0.2.0-beta.1",
+  "version": "0.2.0-beta.2",
   "description": "A bounded task runtime for Web Workers and worker_threads",
   "type": "module",
   "license": "MIT",
@@ -52,6 +52,7 @@
     "test:package": "node scripts/package-smoke.mjs",
     "benchmark:scheduler": "pnpm build && node benchmarks/scheduler.mjs",
     "benchmark:cache": "node benchmarks/cache.mjs",
+    "benchmark:packet": "pnpm build && node benchmarks/packet.mjs",
     "benchmark:resident": "pnpm build && node benchmarks/resident.mjs",
     "benchmark:blocked": "pnpm build && node benchmarks/blocked.mjs"
   },

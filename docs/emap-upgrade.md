@@ -1,6 +1,6 @@
 # emap 资源运行时升级评估与迁移
 
-本次以 Tasklane `0.1.0-beta.4` 和 emap 当前调用代码为基线，升级为 `0.2.0-beta.1`。保留原有 enqueue、enqueuePrepared、惰性 Session 和 ResultLease 契约，新增显式资源生命周期与 Session 准入。新增缓存控制与资源上报后，协议升级为 v6，主线程包和 Worker bundle 必须一起更新。
+本次以 Tasklane `0.1.0-beta.4` 和 emap 当前调用代码为基线，升级为 `0.2.0-beta.2`。保留原有 enqueue、enqueuePrepared、惰性 Session 和 ResultLease 契约，新增显式资源生命周期与 Session 准入。当前版本在缓存控制与资源上报的基础上新增数组按位置编码，协议为 v7，主线程包和 Worker bundle 必须一起更新。
 
 ## 对意见的判断
 

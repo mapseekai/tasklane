@@ -39,13 +39,14 @@ export class BudgetLedger {
       }
     }
   }
+  available(key: keyof RuntimeBudgets, priority: Priority = 'interactive'): number {
+    const total = this.limits[key] - this.used[key];
+    return priority === 'interactive'
+      ? total
+      : Math.min(total, this.limits[key] - this.protected[key] - this.nonInteractive[key]);
+  }
   fits(cost: Partial<RuntimeBudgets>, priority: Priority = 'interactive'): boolean {
-    return keys.every(
-      (key) =>
-        this.used[key] + (cost[key] ?? 0) <= this.limits[key] &&
-        (priority === 'interactive' ||
-          this.nonInteractive[key] + (cost[key] ?? 0) <= this.limits[key] - this.protected[key]),
-    );
+    return keys.every((key) => (cost[key] ?? 0) <= this.available(key, priority));
   }
   reserve(cost: Partial<RuntimeBudgets>, priority: Priority = 'foreground'): () => void {
     this.validate(cost, priority);

@@ -204,7 +204,10 @@ test('async prepare is rejected immediately and returns all credits', async (t) 
       prepare: () => new Promise(() => {}),
     }),
   );
-  await assert.rejects(h.result, { code: 'INVALID_ARGUMENT' });
+  await assert.rejects(h.result, {
+    code: 'INVALID_ARGUMENT',
+    message: /enqueuePrepared for async I\/O and a Worker handler for CPU-heavy work/,
+  });
   await h.settled;
   assert.equal(rt.stats.active, 0);
   assert.equal(rt.stats.reserved.inputBytes, 0);

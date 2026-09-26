@@ -360,7 +360,7 @@ await ctx.cache.delete(key)
 
 ## 13. 协议
 
-协议版本为 6，Runtime 与 Host 必须使用同一版本。消息还携带 Worker epoch：
+协议版本为 7，Runtime 与 Host 必须使用同一版本。v7 为数组连续元素使用按位置编码的 items，空洞后的元素和自定义属性仍使用 props。消息还携带 Worker epoch：
 
 ```text
 hello

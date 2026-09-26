@@ -1,6 +1,7 @@
 import { decodeError } from '../remote-error.js';
 import { validateProgress } from '../progress.js';
 import {
+  checkBlobLimit,
   encodePacket,
   packetBytes,
   packetBlobBytes,
@@ -102,7 +103,6 @@ interface Slot {
   resourceCacheStats: CacheStats;
   reports: ResourceCacheSnapshot[];
   cacheLimit: number;
-  deferredCacheResize?: boolean;
   priority: Priority;
   control?: {
     id: string;
@@ -196,6 +196,7 @@ let runtimeSerial = 0;
 /** Application-owned runtime; no hidden module-global pool, CPU budget or dataset. */
 export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
   private readonly pools = new Map<string, Pool>();
+  private readonly pendingShrinks = new Map<Pool, { reason: ReclaimReason; sessions: boolean }>();
   private readonly scopes = new Set<ScopeRecord>();
   private readonly jobs = new Map<string, Job>();
   private readonly queue = new Set<Job>();
@@ -547,7 +548,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       .then(work)
       .finally(() => {
         this.maintenance = undefined;
-        this.schedule('workers', 'cache-budget');
+        this.wakeReclamation();
       });
     this.maintenance = result;
     return result;
@@ -569,6 +570,8 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       throw new RuntimeError('INVALID_ARGUMENT', 'Pool targets exceed configured bounds');
     pool.capacity = size;
     pool.cacheTarget = cacheBytes;
+    if (this.shrinkNeeded(pool)) this.pendingShrinks.set(pool, { reason, sessions });
+    else this.pendingShrinks.delete(pool);
     this.schedule(this.poolKey(pool), 'workers', 'cache-budget');
     const failures: { pool: string; worker: number; message: string }[] = [];
     let workersReclaimed = 0;
@@ -577,18 +580,11 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     const eligible = (slot: Slot) =>
       (this.available(slot) && slot.state === 'ready') ||
       (sessions && this.reclaimableSession(slot));
-    const victims = [...pool.slots]
-      .filter(eligible)
-      .sort(
-        (a, b) =>
-          Number(!!a.session) - Number(!!b.session) ||
-          (a.session?.reclaimPriority ?? 0) - (b.session?.reclaimPriority ?? 0) ||
-          a.used - b.used,
-      );
+    const victims = this.shrinkCandidates(pool, sessions);
     for (const slot of victims) {
-      if (this.closed || pool.slots.size <= (liveTarget ?? size)) break;
+      if (this.closed || !this.shrinkNeeded(pool, undefined, liveTarget)) break;
       // Earlier cleanup may have yielded while another candidate received work or a lease.
-      if (!eligible(slot)) continue;
+      if (!eligible(slot) || !this.shrinkNeeded(pool, slot.priority, liveTarget)) continue;
       try {
         await this.reclaimSlot(slot, reason);
         workersReclaimed++;
@@ -599,11 +595,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     for (const slot of [...pool.slots]) {
       if (this.closed) break;
       if (slot.state === 'closed' || slot.state === 'closing') continue;
-      if (reason === 'adaptive' && (slot.job || slot.state === 'starting')) {
-        slot.deferredCacheResize = slot.cacheLimit !== cacheBytes;
-        continue;
-      }
-      slot.deferredCacheResize = false;
+      if (reason === 'adaptive' && (slot.job || slot.state === 'starting')) continue;
       try {
         await this.resizeCache(slot, cacheBytes, cacheBytes < slot.cacheLimit);
       } catch (error) {
@@ -613,6 +605,69 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     this.schedule(`pool:${name}`, 'workers', 'cache-budget');
     const after = [...pool.slots].reduce((n, s) => n + s.cacheLimit, 0);
     return { workersReclaimed, cacheBytesReleased: Math.max(0, before - after), failures };
+  }
+  private liveSlots(pool: Pool): Slot[] {
+    // In-flight termination still holds physical credits, but is already a selected victim.
+    return [...pool.slots].filter(
+      (slot) => slot.state !== 'closing' && slot.state !== 'closed' && !slot.session?.closed,
+    );
+  }
+  private shrinkNeeded(pool: Pool, priority?: Priority, target = pool.capacity): boolean {
+    const slots = this.liveSlots(pool);
+    // Explicit trim/critical pressure may discard idle Workers below the future admission floor.
+    if (target < pool.capacity) return slots.length > target;
+    if (
+      slots.filter((slot) => slot.priority !== 'interactive').length >
+      Math.max(0, target - pool.options.interactiveWorkers)
+    )
+      return priority !== 'interactive';
+    return slots.length > target;
+  }
+  private shrinkCandidates(pool: Pool, sessions: boolean): Slot[] {
+    const nonInteractiveFirst = this.shrinkNeeded(pool) && !this.shrinkNeeded(pool, 'interactive');
+    return [...pool.slots]
+      .filter(
+        (slot) =>
+          (this.available(slot) && slot.state === 'ready') ||
+          (sessions && this.reclaimableSession(slot)),
+      )
+      .sort(
+        (a, b) =>
+          (nonInteractiveFirst
+            ? Number(a.priority === 'interactive') - Number(b.priority === 'interactive')
+            : 0) ||
+          Number(!!a.session) - Number(!!b.session) ||
+          (a.session?.reclaimPriority ?? 0) - (b.session?.reclaimPriority ?? 0) ||
+          a.used - b.used,
+      );
+  }
+  private reconcileShrinks(): void {
+    if (this.maintenance) return;
+    for (const [pool, { reason, sessions }] of this.pendingShrinks) {
+      for (const slot of this.shrinkCandidates(pool, sessions)) {
+        if (!this.shrinkNeeded(pool)) break;
+        if (
+          !this.shrinkNeeded(pool, slot.priority) ||
+          !(
+            (this.available(slot) && slot.state === 'ready') ||
+            (sessions && this.reclaimableSession(slot))
+          )
+        )
+          continue;
+        void this.reclaimSlot(slot, reason).catch((cause) =>
+          this.observe(
+            new RuntimeError(
+              'WORKER_FAILED',
+              'Deferred pool shrink failed; capacity remains held',
+              {
+                cause,
+              },
+            ),
+          ),
+        );
+      }
+      if (!this.shrinkNeeded(pool)) this.pendingShrinks.delete(pool);
+    }
   }
   private async resizeCache(slot: Slot, limit: number, trim: boolean): Promise<void> {
     await slot.ready.promise;
@@ -688,12 +743,17 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
                   : pool.cacheTarget;
               const reconcile = [...pool.slots].some(
                 (slot) =>
-                  (slot.deferredCacheResize &&
+                  (slot.cacheLimit !== pool.cacheTarget &&
                     slot.state === 'ready' &&
                     !slot.job &&
                     !slot.control &&
-                    !slot.releases.size) ||
-                  (pool.slots.size > size &&
+                    !slot.releases.size &&
+                    (slot.cacheLimit > pool.cacheTarget ||
+                      this.ledger.fits(
+                        { cacheBytes: pool.cacheTarget - slot.cacheLimit },
+                        slot.priority,
+                      ))) ||
+                  (this.shrinkNeeded(pool, slot.priority, size) &&
                     ((this.available(slot) && slot.state === 'ready') ||
                       this.reclaimableSession(slot))),
               );
@@ -789,7 +849,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     };
   }
   private poolBlockers(pool: Pool, priority: Priority = 'interactive'): AdmissionBlocker[] {
-    if ([...pool.slots].some((s) => this.available(s) && this.slotClass(s, priority))) return [];
+    if ([...pool.slots].some((s) => this.availableFor(s, priority))) return [];
     const reasons: AdmissionBlocker[] = [];
     if (this.classBlocked(pool, priority)) reasons.push('interactive-reserve');
     if ([...pool.slots].some((s) => s.control)) reasons.push('maintenance');
@@ -834,8 +894,10 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       this.scheduler.priority(candidate) >= this.scheduler.priority(reserved) &&
       (['inputBytes', 'scratchBytes', 'outputBytes'] as const).some(
         (key) =>
-          reserved.cost[key] > this.ledger.limits[key] - this.ledger.used[key] &&
-          candidate.cost[key] > 0,
+          candidate.cost[key] > 0 &&
+          (reserved.cost[key] > this.ledger.available(key) ||
+            (candidate.options.priority !== 'interactive' &&
+              reserved.cost[key] > this.ledger.available(key, reserved.options.priority))),
       )
     );
   }
@@ -935,6 +997,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
   dispose(): Promise<void> {
     if (this.disposal) return this.disposal;
     this.closed = true;
+    this.pendingShrinks.clear();
     clearTimeout(this.adaptiveTimer);
     clearTimeout(this.schedulerTimer);
     const work = [...this.jobs.values()].map((job) => job.settled.promise);
@@ -1143,9 +1206,8 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
         }
         const pool = this.pools.get(session.pool)!;
         const capacity =
-          [...pool.slots].some(
-            (slot) => this.available(slot) && this.slotClass(slot, session.priority),
-          ) || this.canSpawn(pool, session.priority);
+          [...pool.slots].some((slot) => this.availableFor(slot, session.priority)) ||
+          this.canSpawn(pool, session.priority);
         if (!capacity) {
           if (request.mode === 'wait')
             this.reclaimIdle(this.reclaimVictim(pool, !session.reclaimable, session.priority));
@@ -1297,7 +1359,8 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       id: `${this.prefix}/job-${order}`,
       order,
       groupKey: `${scope.id}\0${raw.group ?? 'default'}`,
-      laneKey: `${raw.pool}\0${session?.id ?? candidates?.map((s) => s.id).join(',') ?? ''}`,
+      // Ageing can equalize ranks, but a non-interactive head must not hide interactive reserves.
+      laneKey: `${raw.pool}\0${session?.id ?? candidates?.map((s) => s.id).join(',') ?? ''}\0${priority === 'interactive'}`,
       affinityKeys,
       phase: 'queue',
       name,
@@ -1443,6 +1506,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       clearTimeout(acquisition.timer);
       acquisition.removeSignal?.();
       acquisition.result.reject(new RuntimeError('CLOSED', 'Session disposed during admission'));
+      this.schedule(`pool:${session.pool}`, 'reservation');
     }
     for (const lease of [...session.leases]) lease.release();
     const jobs = [...session.scope.jobs].filter((job) => job.session === session);
@@ -1488,6 +1552,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     if (this.closed || this.draining) return;
     this.draining = true;
     try {
+      this.reconcileShrinks();
       this.admitSessions();
       while (this.queue.size) {
         const now = performance.now();
@@ -1551,8 +1616,12 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
                 now - candidate.enqueuedAt < this.options.budgetWaitMs
               )
                 candidate.admissionTimer = setTimeout(
-                  () => this.schedule('budget', 'reservation'),
-                  this.options.budgetWaitMs - (now - candidate.enqueuedAt),
+                  () => {
+                    // Timer clocks can fire early; the next drain must be able to rearm it.
+                    candidate.admissionTimer = undefined;
+                    this.schedule('budget', 'reservation');
+                  },
+                  Math.ceil(this.options.budgetWaitMs - (now - candidate.enqueuedAt)),
                 );
               return block('budget', ...this.slotWaitKeys(candidate));
             }
@@ -1607,10 +1676,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     const pool = this.pools.get(job.options.pool)!;
     if (
       [...pool.slots].some(
-        (slot) =>
-          this.available(slot) &&
-          this.slotClass(slot, job.options.priority!) &&
-          slot.state === 'ready',
+        (slot) => this.availableFor(slot, job.options.priority!) && slot.state === 'ready',
       )
     )
       return true;
@@ -1707,6 +1773,17 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       (slot.state === 'ready' || slot.state === 'starting')
     );
   }
+  private availableFor(slot: Slot, priority: Priority): boolean {
+    // Shrink may leave busy/required non-interactive Workers above the new class target.
+    return (
+      this.available(slot) &&
+      this.slotClass(slot, priority) &&
+      (priority === 'interactive' ||
+        slot.pool.slots.size <= slot.pool.capacity - slot.pool.options.interactiveWorkers ||
+        this.liveSlots(slot.pool).filter((s) => s.priority !== 'interactive').length <=
+          slot.pool.capacity - slot.pool.options.interactiveWorkers)
+    );
+  }
   private reclaimableSession(slot: Slot): boolean {
     const session = slot.session;
     return (
@@ -1764,9 +1841,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     bind?: (slot: Slot) => void,
     priority: Priority = 'foreground',
   ): Slot | undefined {
-    const available = [...pool.slots].filter(
-      (slot) => this.available(slot) && this.slotClass(slot, priority),
-    );
+    const available = [...pool.slots].filter((slot) => this.availableFor(slot, priority));
     const score = (slot: Slot) =>
       affinity.reduce((n, key) => n + Number(this.affinity.get(key)?.has(slot) ?? false), 0);
     if (available.length) {
@@ -1793,7 +1868,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
       void stop
         .finally(() => {
           this.reclaiming = false;
-          this.schedule('workers', 'cache-budget');
+          this.wakeReclamation();
         })
         .catch((cause) =>
           this.observe(
@@ -1803,6 +1878,15 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
           ),
         );
     }
+  }
+
+  private wakeReclamation(): void {
+    // A global reclamation barrier also blocks full pools, whose tasks wait only on pool keys.
+    this.schedule(
+      ...[...this.pools.keys()].map((name) => `pool:${name}`),
+      'workers',
+      'cache-budget',
+    );
   }
 
   private reclaimSlot(slot: Slot, reason: ReclaimReason): Promise<void> {
@@ -1990,7 +2074,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
           void Promise.resolve(value).catch(() => {});
           throw new RuntimeError(
             'INVALID_ARGUMENT',
-            'prepare must return synchronously; perform asynchronous work in the Worker',
+            'prepare must return synchronously; use enqueuePrepared for async I/O and a Worker handler for CPU-heavy work',
           );
         }
         if (!value || !Object.hasOwn(value, 'payload'))
@@ -2013,6 +2097,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
         prepared.payload,
         job.options.budget.inputBytes,
         job.options.blobLimits!.inputBytes,
+        'blobLimits.inputBytes',
       );
       const bytes = packetBytes(payload);
       if (bytes > job.options.budget.inputBytes)
@@ -2276,11 +2361,11 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
     if (message.type === 'result') {
       try {
         const bytes = packetBytes(message.value);
-        if (packetBlobBytes(message.value) > job.options.blobLimits!.outputBytes)
-          throw new RuntimeError(
-            'BUDGET_EXCEEDED',
-            'Worker result exceeds logical blob byte limit',
-          );
+        checkBlobLimit(
+          packetBlobBytes(message.value),
+          job.options.blobLimits!.outputBytes,
+          'blobLimits.outputBytes',
+        );
         if (bytes !== message.byteLength || bytes > job.options.budget.outputBytes)
           throw new RuntimeError(
             'BUDGET_EXCEEDED',

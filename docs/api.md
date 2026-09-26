@@ -569,7 +569,7 @@ await runtime.retryTermination(); // 重试物理终止失败的隔离 Worker
 await runtime.disposeWithin(5000); // 限制等待时间；超时后后台清理继续进行
 ```
 
-`scope.disposeWithin(ms)` 同样只约束等待时间，Session 使用 dispose。协议 v6 的 request 携带 Packet payload、maxOutputBytes、maxOutputBlobBytes 和 maxScratchBytes；progress、Scope 释放和 cache-control 均使用 ACK。主线程包与 Worker bundle 必须同步更新。
+`scope.disposeWithin(ms)` 同样只约束等待时间，Session 使用 dispose。协议 v7 的 request 携带 Packet payload、maxOutputBytes、maxOutputBlobBytes 和 maxScratchBytes；progress、Scope 释放和 cache-control 均使用 ACK。v7 的 Packet 数组支持按位置编码，主线程包与 Worker bundle 必须同步更新。
 
 详见 [资源与调度契约](resources.md)，包括元数据限制、`budgetWaitMs`、`releaseTimeoutMs`、进度 ACK、Scope 释放确认、`withScope`、`disposeWithin`、`resourceDiagnostics` 和 `retryTermination`。
 
@@ -609,6 +609,8 @@ await consumeResult(task, consumeOutput);
 示例中的 loadInput 和 consumeOutput 由应用提供，输入需满足声明的大小与所有权。`PreparedTaskOptions` 保留 TaskOptions 的预算、优先级、group、affinity、取消、超时和 progress 配置，使用 prepareAsync 构造输入。Session 使用 `SessionPreparedTaskOptions`，由其绑定关系提供 pool 和亲和性。
 
 Runtime 配置 `maxPreparingTasks`（默认 2）限制生产中及等待发送的输入数量。完整任务额度在 prepareAsync 执行前预留，scratch 按准备与执行的较大上界计费；准备阶段按结果消费速度接续执行，Worker 在执行准入时绑定。状态依次为 queued、preparing、prepared、starting、running，取消和失败沿用 TaskHandle 的生命周期。
+
+prepareAsync 在调用线程执行，适合等待 fetch、Blob.arrayBuffer 等异步 I/O；async 不会把同步解析或大数组构造移到 Worker。同一优先级、Scope/group、Pool/Session 通道按 FIFO 准入，因此 maxPreparingTasks 是总窗口上限，不保证同组同时准备两项。需要重计算时让 prepare/prepareAsync 只返回小型指令或输入附件，由 handler 处理。
 
 `queueMs` 记录首次准入前的等待，`prepareMs` 记录生产回调时间，`startupMs` 记录绑定 Worker 后的启动等待；`totalMs` 包括准备完成后等待 Worker 的时间。取消后通过 result 获知逻辑结果，通过 settled 等待生产与任务的物理完成。额度和计时细节见 [资源契约](resources.md#异步准备阶段)。
 

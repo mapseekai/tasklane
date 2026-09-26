@@ -2,7 +2,7 @@ import type { Packet } from './packet.js';
 import type { ErrorCode, RemoteErrorInfo } from './errors.js';
 import type { CacheStats, ResourceCacheSnapshot } from './types.js';
 
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 export const PROTOCOL_TAG = '@mapseekai/tasklane';
 
 export interface Header {

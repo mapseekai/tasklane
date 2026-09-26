@@ -103,6 +103,209 @@ function rig(t, configs, handlers = {}, overrides = {}) {
   };
 }
 
+test('maintenance completion wakes a full pool waiting to reclaim a replica', async (t) => {
+  const { rt, scope } = rig(t, { cpu: { size: 1 } });
+  const replica = await scope.acquireSession('cpu', { reclaimable: true });
+  await flush();
+  const resizing = rt.resizePool('cpu', { size: 1 });
+  const required = scope.session('cpu');
+  const task = required.enqueue('ping', { ...options('cpu'), queueTimeoutMs: 200 });
+  await resizing;
+  await take(task);
+  assert.equal(replica.reclaimed, true);
+  assert.equal(required.state, 'bound');
+  assert.equal(rt.stats.scheduler.blockedBuckets, 0);
+});
+
+test('busy Workers converge after shrinking before accepting another burst', async (t) => {
+  const { rt, scope, gate } = rig(t, { cpu: {} });
+  const firstGate = gate();
+  const first = Array.from({ length: 3 }, () =>
+    scope.enqueue('hold', options('cpu', firstGate.index)),
+  );
+  await flush();
+  assert.equal(rt.stats.active, 3);
+  await rt.resizePool('cpu', { size: 1 });
+  assert.equal(rt.stats.active, 3); // Existing tasks are never preempted.
+  firstGate.resolve();
+  await Promise.all(first.map(take));
+  await flush();
+  assert.equal(rt.stats.workers, 1);
+  assert.equal(rt.stats.reserved.cacheBytes, 128);
+  assert.equal(rt.stats.reclaim.byReason.resize, 2);
+  for (let round = 0; round < 3; round++) {
+    const g = gate();
+    const burst = Array.from({ length: 3 }, () => scope.enqueue('hold', options('cpu', g.index)));
+    await flush();
+    assert.equal(rt.stats.active, 1);
+    assert.equal(rt.stats.queued, 2);
+    g.resolve();
+    await Promise.all(burst.map(take));
+  }
+});
+
+test('deferred shrink preserves required Sessions and waits for replica result leases', async (t) => {
+  const { rt, scope, gate } = rig(t, { cpu: { size: 2 } });
+  const primary = await scope.acquireSession('cpu');
+  const replica = await scope.acquireSession('cpu', { reclaimable: true, residentBytes: 32 });
+  const g = gate();
+  const running = replica.enqueue('hold', options('cpu', g.index));
+  await flush();
+  await rt.resizePool('cpu', { size: 1 });
+  g.resolve();
+  const lease = await running.result;
+  await flush();
+  assert.equal(replica.state, 'bound');
+  assert.equal(rt.stats.workers, 2);
+  lease.release();
+  await flush();
+  assert.equal(replica.reclaimed, true);
+  assert.equal(replica.state, 'closed');
+  assert.equal(primary.state, 'bound');
+  assert.equal(rt.stats.workers, 1);
+  assert.equal(rt.stats.reserved.residentBytes, 0);
+});
+
+test('growing a pool cancels a shrink deferred by busy Workers', async (t) => {
+  const { rt, scope, gate } = rig(t, { cpu: {} });
+  const g = gate();
+  const tasks = Array.from({ length: 3 }, () => scope.enqueue('hold', options('cpu', g.index)));
+  await flush();
+  await rt.resizePool('cpu', { size: 1 });
+  await rt.resizePool('cpu', { size: 3 });
+  g.resolve();
+  await Promise.all(tasks.map(take));
+  await flush();
+  assert.equal(rt.stats.workers, 3);
+  assert.equal(rt.stats.reclaim.attempts, 0);
+});
+
+for (const mode of ['idle', 'busy', 'unspawned-interactive']) {
+  test(`${mode}: shrinking preserves interactive Worker capacity`, async (t) => {
+    const { rt, scope, gate } = rig(t, { cpu: { size: 3, interactiveWorkers: 1 } });
+    const urgentGate = gate(),
+      workGate = gate();
+    const urgent =
+      mode === 'unspawned-interactive'
+        ? undefined
+        : scope.enqueue('hold', {
+            ...options('cpu', urgentGate.index),
+            priority: 'interactive',
+          });
+    const work = Array.from({ length: 2 }, () =>
+      scope.enqueue('hold', options('cpu', workGate.index)),
+    );
+    await flush();
+    if (urgent) {
+      urgentGate.resolve();
+      await take(urgent);
+    }
+    if (mode === 'idle') {
+      workGate.resolve();
+      await Promise.all(work.map(take));
+    }
+    await rt.resizePool('cpu', { size: 2 });
+    if (mode !== 'idle') {
+      // The idle interactive Worker must survive while foreground tasks still exceed their quota.
+      if (urgent) assert.equal(rt.stats.workers, 3);
+      workGate.resolve();
+      await Promise.all(work.map(take));
+    }
+    await flush();
+    const nextGate = gate();
+    const next = Array.from({ length: 2 }, () =>
+      scope.enqueue('hold', options('cpu', nextGate.index)),
+    );
+    await flush();
+    assert.deepEqual(next.map((h) => h.state).sort(), ['queued', 'running']);
+    await take(
+      scope.enqueue('ping', { ...options('cpu'), priority: 'interactive', queueTimeoutMs: 200 }),
+    );
+    assert.equal(rt.stats.workers, 2);
+    nextGate.resolve();
+    await Promise.all(next.map(take));
+  });
+}
+
+test('class shrink preserves required Sessions and their interactive Worker', async (t) => {
+  const { rt, scope, gate } = rig(t, { cpu: { size: 3, interactiveWorkers: 1 } });
+  const urgentGate = gate();
+  const urgent = scope.enqueue('hold', {
+    ...options('cpu', urgentGate.index),
+    priority: 'interactive',
+  });
+  await flush();
+  const primaries = await Promise.all([scope.acquireSession('cpu'), scope.acquireSession('cpu')]);
+  urgentGate.resolve();
+  await take(urgent);
+  const report = await rt.resizePool('cpu', { size: 2 });
+  assert.equal(report.workersReclaimed, 0);
+  assert.equal(rt.stats.workers, 3); // Required Sessions retain their physical capacity.
+  await take(
+    scope.enqueue('ping', { ...options('cpu'), priority: 'interactive', queueTimeoutMs: 200 }),
+  );
+  await Promise.all(primaries.map((session) => take(session.enqueue('ping', options('cpu')))));
+  await primaries[0].dispose();
+  await flush();
+  assert.equal(rt.stats.workers, 2);
+  assert.equal(primaries[1].state, 'bound');
+});
+
+test('explicit trim can retire idle interactive Workers while retaining required Sessions', async (t) => {
+  const { rt, scope, gate } = rig(t, { cpu: { size: 2, interactiveWorkers: 1 } });
+  const g = gate();
+  const urgent = scope.enqueue('hold', { ...options('cpu', g.index), priority: 'interactive' });
+  await flush();
+  const primary = await scope.acquireSession('cpu');
+  g.resolve();
+  await take(urgent);
+  const report = await rt.trim();
+  assert.equal(report.workersReclaimed, 1);
+  assert.equal(rt.stats.workers, 1);
+  assert.equal(primary.state, 'bound');
+  await take(primary.enqueue('ping', options('cpu')));
+});
+
+test('adaptive cache growth retries the unchanged target after budget becomes available', async (t) => {
+  const time = clock(t),
+    diagnostics = [];
+  const { rt, scope, controls } = rig(
+    t,
+    {
+      adaptive: {
+        size: 1,
+        cacheBytes: 48,
+        adaptive: { minCacheBytes: 32, sampleMs: 100, idleMs: 10000 },
+      },
+      holder: { size: 1, cacheBytes: 48 },
+    },
+    {
+      churn: (_, ctx) => {
+        ctx.cache.get('missing');
+        ctx.cache.setBinary('a', new Uint8Array(24));
+        ctx.cache.setBinary('b', new Uint8Array(24));
+        return output(null);
+      },
+    },
+    { budgets: { cacheBytes: 80 }, onDiagnostic: (e) => diagnostics.push(e) },
+  );
+  const holder = await scope.acquireSession('holder');
+  await take(scope.enqueue('churn', options('adaptive')));
+  await time.advance(100);
+  assert.equal(rt.diagnostics().pools[0].cacheBytesPerWorker, 48);
+  assert.equal(rt.diagnostics().pools[0].cacheReservedBytes, 32);
+  assert.equal(diagnostics.length, 1);
+  await time.advance(300);
+  assert.equal(diagnostics.length, 1); // No repeated futile reservations while the budget is held.
+  await holder.dispose();
+  await time.advance(100);
+  assert.equal(rt.diagnostics().pools[0].cacheReservedBytes, 48);
+  assert.deepEqual(
+    controls.filter((c) => c.pool === 'adaptive').map((c) => c.limit),
+    [48],
+  );
+});
+
 test('adaptive pools respect independent sample periods and recover to their idle floors', async (t) => {
   const time = clock(t);
   const { rt, scope, gate } = rig(t, {

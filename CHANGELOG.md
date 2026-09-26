@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0-beta.2 — 2026-09-26
+
+- Encode array prefixes without string index keys and decode them in place, preserving holes, custom properties, graph identity and scalar values. Protocol v7 requires updating the main package and Worker bundle together.
+- Report the required Blob/File bytes and the input/output blobLimits field on budget failures; clarify caller-thread preparation, preparation windows and scratch/adaptive boundaries.
+- Wake full-pool task queues after maintenance and Session admission after a waiting primary owner closes.
+- Reconcile deferred Worker shrink before new admission, preserving required Sessions, result leases and physical termination credits.
+- Apply starvation protection to non-interactive byte shortages while preserving interactive reserved capacity, including separate admission-class lanes after ageing.
+- Resume lazy Session reclamation after a failed termination, retaining quarantined Worker credits while trying healthy victims.
+- Preserve interactive Worker headroom during immediate and deferred pool shrink, including reuse of existing Workers.
+- Retry adaptive cache target mismatches when growth budget returns, without repeating failed reservations while capacity is still held.
+- Rearm early budget-wait timers so fractional timer delays cannot disable starvation protection.
+
 ## 0.2.0-beta.1 — 2026-09-26
 
 - Scoped resident ResourceLease budgets, bounded handle counts and atomic resize.

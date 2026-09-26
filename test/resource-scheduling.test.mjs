@@ -388,6 +388,68 @@ test('failed Worker reclamation stays charged, is reported, and does not stop he
   assert.equal(rt.stats.reserved.cacheBytes, 0);
 });
 
+test('failed reclamation wakes a full pool so a lazy Session can reclaim the next replica', async (t) => {
+  let fail = true;
+  const { rt, scope } = rig(t, {
+    pool: { size: 2 },
+    cleanup: () => {
+      fail = false;
+    },
+    wrap: (link, id) => ({
+      ...link.endpoint,
+      terminate() {
+        if (id === 1 && fail) throw Error('termination failed');
+        return link.endpoint.terminate();
+      },
+    }),
+  });
+  const first = await scope.acquireSession('cpu', { reclaimable: true });
+  const second = await scope.acquireSession('cpu', { reclaimable: true });
+  const primary = scope.session('cpu');
+  assert.equal(await take(primary.enqueue('id', task(null, { queueTimeoutMs: 200 }))), 3);
+  assert.equal(first.state, 'closed');
+  assert.equal(second.reclaimed, true);
+  assert.equal(rt.stats.quarantinedWorkers, 1);
+  assert.equal(rt.stats.workers, 2);
+  assert.equal(rt.stats.reclaim.failed, 1);
+  assert.equal(rt.stats.reclaim.succeeded, 1);
+  assert.equal(rt.stats.reserved.cacheBytes, 256);
+  fail = false;
+  await rt.retryTermination();
+  assert.equal(rt.stats.workers, 1);
+});
+
+test('deferred shrink holds physical credits and never selects extra victims during termination', async (t) => {
+  const termination = deferred();
+  const { rt, scope, gate } = rig(t, {
+    cleanup: () => termination.resolve(),
+    wrap: (link) => ({
+      ...link.endpoint,
+      async terminate() {
+        await termination.promise;
+        link.endpoint.terminate();
+      },
+    }),
+  });
+  const g = gate();
+  const running = Array.from({ length: 3 }, () =>
+    scope.enqueue('hold', task(g.index, { pool: 'cpu' })),
+  );
+  await until(() => running.every((h) => h.state === 'running'));
+  await rt.resizePool('cpu', { size: 1 });
+  g.resolve();
+  await Promise.all(running.map(take));
+  await until(() => rt.stats.closingWorkers === 2);
+  await take(scope.enqueue('id', task(null, { pool: 'cpu' })));
+  assert.equal(rt.stats.workers, 3);
+  assert.equal(rt.stats.closingWorkers, 2);
+  assert.equal(rt.stats.reserved.cacheBytes, 384);
+  assert.equal(rt.stats.reclaim.attempts, 2);
+  termination.resolve();
+  await until(() => rt.stats.workers === 1);
+  assert.equal(rt.stats.reserved.cacheBytes, 128);
+});
+
 test('cache control timeout holds old and growth credits until physical termination completes', async (t) => {
   const termination = deferred();
   let blocked = false;

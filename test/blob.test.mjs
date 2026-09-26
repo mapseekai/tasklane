@@ -5,7 +5,7 @@ import { createWorkerRuntime, packetByteLength } from '../dist/index.js';
 import { nodeWorker } from '../dist/adapters/node.js';
 import { createLoopback } from '../dist/testing.js';
 import { serve, output } from '../dist/host.js';
-import { header } from '../dist/protocol.js';
+import { header, PROTOCOL_VERSION } from '../dist/protocol.js';
 import { CacheStore } from '../dist/resources/cache.js';
 import { runtime, options, take } from './helpers.mjs';
 import { readFileChunks } from '../examples/file-chunks/read.mjs';
@@ -57,13 +57,14 @@ test('real Node Worker preserves File results and enforces both logical limits',
   t.after(() => rt.dispose());
   const scope = rt.createScope();
   const file = new File(['abcdef'], 'x.tif', { type: 'image/tiff', lastModified: 123 });
-  for (const blobLimits of [
-    undefined,
-    { inputBytes: 5, outputBytes: 6 },
-    { inputBytes: 6, outputBytes: 5 },
+  for (const [blobLimits, field, limit] of [
+    [undefined, 'inputBytes', 0],
+    [{ inputBytes: 5, outputBytes: 6 }, 'inputBytes', 5],
+    [{ inputBytes: 6, outputBytes: 5 }, 'outputBytes', 5],
   ]) {
     await assert.rejects(scope.enqueue('ping', options(file, { blobLimits })).result, {
       code: 'BUDGET_EXCEEDED',
+      message: new RegExp(`require 6 bytes; blobLimits\\.${field} allows ${limit} bytes`),
     });
   }
   const value = await take(
@@ -115,6 +116,7 @@ test('forged output attachments are checked again at the runtime boundary', asyn
   try {
     await assert.rejects(rt.createScope().enqueue('ping', options(null)).result, {
       code: 'BUDGET_EXCEEDED',
+      message: /blobLimits\.outputBytes allows 0 bytes/,
     });
   } finally {
     await rt.dispose();
@@ -122,13 +124,13 @@ test('forged output attachments are checked again at the runtime boundary', asyn
   }
 });
 
-test('previous protocol hosts fail within startup timeout', async () => {
+test('previous protocol hosts are rejected during the handshake', async () => {
   const link = createLoopback();
   const off = link.host.onMessage((message) => {
-    if (message.type === 'hello' && message.version === 3)
+    if (message.type === 'hello')
       link.host.postMessage({
         ...header(message.epoch),
-        version: 3,
+        version: PROTOCOL_VERSION - 1,
         type: 'ready',
         tasks: ['ping'],
       });
@@ -139,7 +141,7 @@ test('previous protocol hosts fail within startup timeout', async () => {
   });
   try {
     await assert.rejects(rt.createScope().enqueue('ping', options(null)).result, {
-      code: 'STARTUP_TIMEOUT',
+      code: 'PROTOCOL_ERROR',
     });
   } finally {
     await rt.dispose();

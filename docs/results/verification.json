@@ -1,5 +1,7 @@
 {
-  "date": "2026-09-25",
+  "date": "2026-09-26",
+  "version": "0.2.0-beta.2",
+  "nodeVersions": ["22.23.1", "24.19.0"],
   "commands": {
     "typecheck": "passed",
     "format": "passed",
@@ -8,13 +10,14 @@
     "packageInstalledSmoke": "passed"
   },
   "unit": {
-    "tests": 114,
-    "passed": 114,
+    "tests": 236,
+    "passed": 236,
     "failed": 0,
-    "skipped": 0
+    "skipped": 0,
+    "countScope": "per Node version"
   },
   "browser": {
-    "passed": 39,
+    "passed": 81,
     "failed": 0,
     "flaky": 0,
     "skipped": 0,
@@ -24,10 +27,21 @@
     "tests": 4,
     "passed": 4,
     "failed": 0,
-    "skipped": 0
+    "skipped": 0,
+    "countScope": "per Node version"
   },
-  "protocolVersion": 3,
-  "scope": "Local validation of the current working tree; remote CI was not checked. Performance snapshots are separate historical runs.",
+  "codecProbe": {
+    "seededGraphs": 1000,
+    "passed": 1000,
+    "checks": [
+      "native structuredClone parity",
+      "reference identity",
+      "sparse arrays",
+      "exact packet budgets"
+    ]
+  },
+  "protocolVersion": 7,
+  "scope": "Local validation of the release candidate. Remote CI is recorded in GitHub Actions for the release commit. Full performance snapshots are historical; the current codec comparison is documented in performance.md.",
   "examples": {
     "browserCompletionAndCancellation": "passed in all three browser engines",
     "node": "passed: node examples/node.mjs; output [2,4,6], workers/leases/scopes returned to zero"

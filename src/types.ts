@@ -81,7 +81,7 @@ export interface TaskOptions<Input> {
   budget: TaskBudget;
   /** Per-packet logical Blob/File sizes; defaults to zero. Not reserved heap/RSS credits. */
   blobLimits?: { inputBytes: number; outputBytes: number };
-  /** Synchronous input construction. Use enqueuePrepared for asynchronous input preparation. */
+  /** Runs synchronously in the caller realm while holding a Worker. Keep CPU-heavy work in handlers. */
   prepare(context: { signal: AbortSignal }): PreparedInput<Input>;
   priority?: Priority;
   /** Fairness is per scope + group, not merely per task. */
@@ -100,6 +100,7 @@ export interface TaskOptions<Input> {
 
 /** Budgeted asynchronous production before Worker admission. */
 export interface PreparedTaskOptions<Input> extends Omit<TaskOptions<Input>, 'prepare'> {
+  /** Runs in the caller realm without a Worker; async I/O can overlap, synchronous work still blocks. */
   prepareAsync(context: {
     signal: AbortSignal;
   }): PreparedInput<Input> | Promise<PreparedInput<Input>>;

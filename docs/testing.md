@@ -2,13 +2,15 @@
 
 ## 1. 当前验收结果
 
-2026-09-25 本机验收（协议 v3）：
+2026-09-26 本机验收（`0.2.0-beta.2`，协议 v7）：
 
 | 范围 | 通过 | 失败 | 跳过 |
 | --- | ---: | ---: | ---: |
-| 单元、故障注入、真实 Node Worker 集成 | 114 | 0 | 0 |
-| Chrome / Firefox / WebKit 浏览器 | 39 | 0 | 0 |
-| 大数据与取消压力 | 4 | 0 | 0 |
+| Node 22.23.1：单元、故障注入、真实 Worker 集成 | 236 | 0 | 0 |
+| Node 24.19.0：单元、故障注入、真实 Worker 集成 | 236 | 0 | 0 |
+| Chrome / Firefox / WebKit 浏览器 | 81 | 0 | 0 |
+| Node 22.23.1：大数据与取消压力 | 4 | 0 | 0 |
+| Node 24.19.0：大数据与取消压力 | 4 | 0 | 0 |
 
 同时通过：
 
@@ -21,7 +23,9 @@
 - 独立目录安装 tarball
 - tarball 中真实 Node Worker 冒烟
 
-GitHub Actions 配置覆盖 Node.js 22/24 与浏览器；上述是本机结果，本次未核验远端 CI 运行状态。
+GitHub Actions 配置覆盖 Node.js 22/24 与浏览器；上述是本机结果，待发提交的远端 CI 结果以 GitHub Actions 中对应 commit 的运行记录为准。
+
+另有 1000 组固定种子的循环对象图探针通过，比较原生 structuredClone 的值与引用身份，并校验稀疏数组和精确预算边界。完整性能矩阵未重跑；本版新增数组编解码对比见 [性能验证](performance.md#数组编解码基准)。
 
 结构化摘要位于仓库 `docs/results/verification.json`；原始结果通过源码仓库提供。
 
@@ -97,6 +101,8 @@ GitHub Actions 配置覆盖 Node.js 22/24 与浏览器；上述是本机结果�
 - 跨 Pool 回收数量、启动期取消、同步握手失败与提前响应
 - Packet 对象图身份、元数据计费、延迟解码与消费失败释放
 - 20 万元素数字数组与超宽输入提前拒绝
+- 数组按位置编码的预算缩减、空洞、自定义属性、循环别名、特殊数值及嵌套 buffer 转移
+- Blob/File 超额错误中的附件字节数和输入/输出限额字段
 - 普通缓存附加属性、实例资源、异步 disposer 和失败重试
 - Scope 释放 ACK、租约/Scope 数量上限与 terminate 重试
 - 永不结束的 Promise prepare 立即拒绝，不阻塞销毁
@@ -150,7 +156,7 @@ Firefox
 WebKit
 ```
 
-每个浏览器运行 13 项测试，组合覆盖：
+每个浏览器运行 27 项测试，组合覆盖：
 
 - 元数据低报、20 万数字数组、scratch 超限与 Promise prepare 拒绝
 - progress 大小/ACK、完成后 context、丢弃结果和异步资源清理
@@ -167,6 +173,9 @@ WebKit
 - module Worker 配置
 - 大数据示例完成
 - 示例取消与资源收敛
+- 数组按位置编码在真实 Worker 中保持循环引用、空洞、特殊数值和转移所有权
+- 维护完成后的准入唤醒、延迟缩容、交互预留和缓存预算恢复
+- 两个自适应池的持续突发、取消、压力切换与最终资源归零
 
 浏览器测试通过真实 Worker URL 和同源 HTTP 服务运行。
 
@@ -312,6 +321,7 @@ pnpm benchmark
 pnpm benchmark:browser
 pnpm benchmark:scheduler
 pnpm benchmark:cache
+pnpm benchmark:packet
 node scripts/report.mjs
 ```
 

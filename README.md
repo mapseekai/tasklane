@@ -74,7 +74,7 @@ Session 适合需要长期绑定同一 Worker 的运行时：
 
 ## 安装与验证
 
-当前开发版本为 `0.2.0-beta.1`，适合业务试点验证；发布状态以 registry 为准。仓库构建和 Node 示例需要 Node.js 22+ 与 pnpm，浏览器端使用 Web Worker。
+当前版本为 `0.2.0-beta.2`，通过 npm 的 `beta` 通道发布，适合业务试点验证。仓库构建和 Node 示例需要 Node.js 22+ 与 pnpm，浏览器端使用 Web Worker。
 
 ```sh
 npm install @mapseekai/tasklane@beta
@@ -254,9 +254,9 @@ Session：用于长期状态型运行时
 
 ## 数据预算与执行边界
 
-任务预算包括字符串、普通数组和协议元数据，使用 `packetByteLength(value)` 计算传输计费量；复合 TypedArray 包还需预留少量元数据空间。结果在首次读取 `lease.value` 时解码。默认采用严格优先级，需要跨优先级老化时设置 `priorityPolicy: 'ageing'`。
+任务预算包括字符串、普通数组和协议元数据，使用 `packetByteLength(value)` 计算传输计费量；该函数会完整编码输入，避免在发送前反复调用。普通数组按位置存储连续元素，仍有 JSON 编解码开销和对象数限制；大量坐标优先使用 `{ op, xy: Float64Array }` 并预留少量元数据空间，需要转移所有权时显式提供 `transfer: [xy.buffer]`。结果在首次读取 `lease.value` 时解码。默认采用严格优先级，需要跨优先级老化时设置 `priorityPolicy: 'ageing'`。
 
-`prepare` 用于同步输入构造；`enqueuePrepared` 支持受预算约束的异步 prepareAsync，计算密集的准备工作适合在 Worker handler 内执行。`ctx.scratch` 提供受额度限制的临时 ArrayBuffer；普通 JS 分配和外部资源仍由算法管理。Runtime 面向可信 Worker，管理任务准入、协议数据与显式申报的资源额度。完整语义见 [资源与调度契约](docs/resources.md)。
+`prepare` 与 `prepareAsync` 都在调用线程执行。prepare 已占用 Worker；enqueuePrepared 在绑定 Worker 前准备输入，默认窗口 2 合计约束准备中与准备完成、等待发送的任务。异步 I/O 适合 prepareAsync，计算密集工作应放在 Worker handler 内。`ctx.scratch` 提供受额度限制的临时 ArrayBuffer；普通 new、JSON.parse 和 WASM 堆由算法管理。非空 File/Blob 需要显式配置 blobLimits，输入和输出默认限额均为 0。Runtime 面向可信 Worker，管理任务准入、协议数据与显式申报的资源额度。完整语义见 [资源与调度契约](docs/resources.md)。
 
 ## License
 
@@ -268,4 +268,4 @@ File/Blob 可作为受约束附件传入或返回，通过任务 `blobLimits` �
 
 ## emap 资源运行时升级
 
-0.2.0-beta.1 新增常驻资源额度、Session 准入/副本回收与 footprint 组路由、交互资源预留、阻塞索引、内存压力回收、可选自适应扩缩容，以及按实际 chunk 上界准入的分块接口。原有任务 API 保持可用；Worker 协议升为 v6，主线程包与 Worker bundle 必须一起更新。见 [资源调度指南](docs/resource-scheduling.md) 和 [评估与迁移指南](docs/emap-upgrade.md)。
+0.2.0-beta.1 新增常驻资源额度、Session 准入/副本回收与 footprint 组路由、交互资源预留、阻塞索引、内存压力回收、可选自适应扩缩容，以及按实际 chunk 上界准入的分块接口。原有任务 API 保持可用；当前源码使用包含数组按位置编码的 Worker 协议 v7，主线程包与 Worker bundle 必须一起更新。见 [资源调度指南](docs/resource-scheduling.md) 和 [评估与迁移指南](docs/emap-upgrade.md)。

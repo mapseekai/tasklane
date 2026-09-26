@@ -74,6 +74,20 @@ test('waiting admission is bounded, abortable and times out without task credits
   await primary.dispose();
   assert.equal((await next).state, 'bound');
 });
+
+test('closing a waiting primary owner immediately admits replicas it was blocking', async (t) => {
+  const { rt, scope } = setup(t, { budgets: { residentBytes: 10 } });
+  rt.resources.acquire({ kind: 'resident', bytes: 10 });
+  const other = rt.createScope();
+  const primary = scope.acquireSession('cpu', { residentBytes: 10 });
+  const rejected = assert.rejects(primary, { code: 'CLOSED' });
+  const replica = other.acquireSession('cpu', { reclaimable: true, timeoutMs: 200 });
+  assert.ok(rt.diagnostics().waiting.some((r) => r.reasons.includes('session-priority')));
+  await scope.dispose();
+  await rejected;
+  assert.equal((await replica).state, 'bound');
+  assert.equal(rt.stats.reserved.residentBytes, 10); // No unrelated release wakes admission.
+});
 test('required admission reclaims an idle replica only after its disposer completes', async (t) => {
   let disposalStarted = false,
     gate;

@@ -7,7 +7,7 @@ const packets = new WeakMap<TaskOutput<unknown>, { packet: Packet; limit: number
 
 /** Snapshot once before plan disposal; binary stores retain normal ownership semantics. */
 export function prepareOutput<T>(result: TaskOutput<T>, limit: number): TaskOutput<T> {
-  const packet = encodePacket(result.value, limit, 0);
+  const packet = encodePacket(result.value, limit, 0, 'blobLimits.outputBytes');
   let decoded = false;
   let value: T;
   const prepared = Object.freeze({
@@ -30,7 +30,7 @@ export function encodeOutput(
   blobLimit: number,
 ): Packet {
   const prepared = packets.get(result);
-  if (!prepared) return encodePacket(result.value, limit, blobLimit);
+  if (!prepared) return encodePacket(result.value, limit, blobLimit, 'blobLimits.outputBytes');
   // Resizable backing buffers can change while plan disposal is awaited.
   if (packetBytes(prepared.packet) > Math.min(limit, prepared.limit))
     throw new RuntimeError('BUDGET_EXCEEDED', 'Prepared output exceeds its announced bytes');

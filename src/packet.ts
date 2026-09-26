@@ -143,19 +143,27 @@ export function packetBlobBytes(packet: Packet): number {
   return bytes;
 }
 
+export function checkBlobLimit(bytes: number, limit: number, option = 'blobLimits'): void {
+  if (bytes > limit)
+    throw new RuntimeError(
+      'BUDGET_EXCEEDED',
+      `Blob/File attachments require ${bytes} bytes; ${option} allows ${limit} bytes. Set ${option} to cover the attachment sizes (default: 0).`,
+    );
+}
+
 /** Encode once at the sender. Metadata is a bounded flat graph; buffers retain transfer semantics. */
 export function encodePacket(
   value: unknown,
   limit = Number.MAX_SAFE_INTEGER,
   maxBlobBytes = Number.MAX_SAFE_INTEGER,
+  blobLimitName = 'blobLimits',
 ): Packet {
   integer(limit, 'packet limit');
   integer(maxBlobBytes, 'blob limit');
   const check = (packet: Packet): Packet => {
     if (packetBytes(packet) > limit)
       throw new RuntimeError('BUDGET_EXCEEDED', 'Packet exceeds reserved bytes');
-    if (packetBlobBytes(packet) > maxBlobBytes)
-      throw new RuntimeError('BUDGET_EXCEEDED', 'Packet exceeds logical blob byte limit');
+    checkBlobLimit(packetBlobBytes(packet), maxBlobBytes, blobLimitName);
     return packet;
   };
   if (value === null || typeof value !== 'object')
@@ -244,8 +252,7 @@ export function encodePacket(
         throw new RuntimeError('BUDGET_EXCEEDED', 'Too many blob attachments');
       logicalBlobBytes += blobSize(item);
       integer(logicalBlobBytes, 'blob bytes');
-      if (logicalBlobBytes > maxBlobBytes)
-        throw new RuntimeError('BUDGET_EXCEEDED', 'Packet exceeds logical blob byte limit');
+      checkBlobLimit(logicalBlobBytes, maxBlobBytes, blobLimitName);
       charge(64 + blobType(item).length * 2);
       node = { type: 'blob', blob: blobs.length };
       if (typeof File !== 'undefined' && item instanceof File) {
@@ -295,7 +302,7 @@ export function encodePacket(
     } else if (Array.isArray(item)) {
       if (item.length > MAX_EDGES - edges)
         throw new RuntimeError('BUDGET_EXCEEDED', 'Array exceeds entry limit');
-      node = { type: 'array', length: item.length };
+      node = { type: 'array', length: item.length, items: [] };
     } else {
       const proto = Object.getPrototypeOf(item);
       if (proto !== null && proto !== Object.prototype)
@@ -304,13 +311,17 @@ export function encodePacket(
     }
     // Typed arrays retain native structured-clone semantics; numeric indices live in the buffer.
     if (!ArrayBuffer.isView(item) && !isBlob(item)) {
-      node.props = [];
       for (const key in item) {
         if (!Object.hasOwn(item, key)) continue;
-        charge(key.length * 2);
         const d = Object.getOwnPropertyDescriptor(item, key);
         if (!d || !('value' in d)) return failure('Packet accessors are forbidden');
-        node.props.push([key, token(d.value)]);
+        // Store the dense prefix positionally; holes and named properties keep explicit keys.
+        if (node.type === 'array' && key === String(node.items!.length)) {
+          node.items!.push(token(d.value));
+        } else {
+          charge(key.length * 2);
+          (node.props ??= []).push([key, token(d.value)]);
+        }
       }
     }
     nodes[cursor] = node;
@@ -331,10 +342,18 @@ export function decodePacket(packet: Packet): unknown {
         return {};
       case 'null-object':
         return Object.create(null);
-      case 'array':
+      case 'array': {
         integer(node.length!, 'array length');
         if (node.length! > MAX_EDGES) return failure('Array too wide');
+        if (node.items !== undefined) {
+          if (!Array.isArray(node.items) || node.items.length > node.length!)
+            return failure('Invalid array entries');
+          // JSON.parse already allocated an array with own writable elements. Reuse it,
+          // resolving references in place below, rather than defining every index again.
+          return node.items;
+        }
         return new Array(node.length);
+      }
       case 'map':
         return new Map();
       case 'set':
@@ -399,7 +418,10 @@ export function decodePacket(packet: Packet): unknown {
     if (node.items) {
       if (!Array.isArray(node.items) || (edges += node.items.length) > MAX_EDGES)
         return failure('Invalid collection');
-      if (node.type === 'map') {
+      if (node.type === 'array') {
+        for (let k = 0; k < node.items.length; k++) (value as unknown[])[k] = read(node.items[k]!);
+        (value as unknown[]).length = node.length!;
+      } else if (node.type === 'map') {
         if (node.items.length % 2) return failure('Invalid map');
         for (let k = 0; k < node.items.length; k += 2)
           (value as Map<unknown, unknown>).set(read(node.items[k]!), read(node.items[k + 1]!));

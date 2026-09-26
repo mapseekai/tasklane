@@ -1,6 +1,6 @@
 # 资源调度、缓存反馈与内存压力
 
-这些能力属于 Tasklane `0.2.0-beta.1`。Worker 协议升级为 **v6**，主线程包和 Worker bundle 必须一起更新。默认不启用交互资源预留和自适应扩缩容；原有 enqueue、惰性 Session 和 ResultLease API 保持可用。
+这些能力自 Tasklane `0.2.0-beta.1` 引入。当前源码的数组编码使用 Worker 协议 **v7**，主线程包和 Worker bundle 必须一起更新。默认不启用交互资源预留和自适应扩缩容；原有 enqueue、惰性 Session 和 ResultLease API 保持可用。
 
 ## Session 组与真实 footprint
 
@@ -59,7 +59,7 @@ const session = await scope.acquireSession('raster', { priority: 'interactive' }
 
 所有预留默认 0。foreground/background 合计只能使用总上限减去预留的额度；interactive 可使用全部总额，但不能超出总上限。预算支持 inputBytes、scratchBytes、outputBytes、cacheBytes、residentBytes。池内 interactiveWorkers 与全局 workers 分别生效。预留执行槽位不会自动创建或预留 Worker，因此需要物理隔离时应同时配置 Worker 和适当的缓存额度。
 
-Session 准入和 resources.acquire 可指定 priority，默认 foreground；Session 内的任务和资源默认继承其优先级。启用 Worker/cache 隔离时，受保护的 interactive Session 不接受降为非 interactive 的任务。任务老化只改变排队顺序，不改变其资源类别。显式预留大于总量会被拒绝；任务自身超过所属类别字节上限会立即抛 BUDGET_EXCEEDED。
+Session 准入和 resources.acquire 可指定 priority，默认 foreground；Session 内的任务和资源默认继承其优先级。启用 Worker/cache 隔离时，受保护的 interactive Session 不接受降为非 interactive 的任务。任务老化只改变排队顺序，不改变其资源类别；老化后仍按交互/非交互类别区分通道，避免非交互队头阻挡可使用预留额度的交互任务。显式预留大于总量会被拒绝；任务自身超过所属类别字节上限会立即抛 BUDGET_EXCEEDED。
 
 预留不抢占正在执行的算法、不驱逐必需 Session，也不承诺交互延迟 SLA。若全部容量被配置为 interactive，非交互任务可持续等待到其超时。持有的输出租约继续占用所属类别额度，直到 release。
 
@@ -67,7 +67,7 @@ Session 准入和 resources.acquire 可指定 priority，默认 foreground；Ses
 
 调度器为被阻塞的通道头部登记 pool、Worker、预算、执行槽位、准备窗口、结果租约、预算 reservation 等依赖；对应事件发生后才重新参与选择。新增同通道队尾任务不会反复检查仍然阻塞的头部。取消头部、准备完成和优先级老化会更新索引，其他通道继续保持公平性与 FIFO 语义。
 
-`stats.scheduler` 暴露 blockedBuckets、累计 eligibilityChecks 和 wakeups。初次登记仍需检查候选；共享预算或执行槽位变化也会唤醒相关等待者。Session 准入队列仍按必需性和优先级检查，不能将这项优化理解为所有运行时操作都具有常数复杂度。
+`stats.scheduler` 暴露 blockedBuckets、累计 eligibilityChecks 和 wakeups。初次登记仍需检查候选；共享预算或执行槽位变化也会唤醒相关等待者。全局维护或回收屏障结束时会唤醒各池，包括终止失败后等待其他健康副本的满池队列；失败 Worker 的物理额度仍保留。Session 准入队列仍按必需性和优先级检查，不能将这项优化理解为所有运行时操作都具有常数复杂度。
 
 `pnpm benchmark:blocked` 使用真实 Node Worker 比较不同数量的被占满池通道与同样数量的独立池任务，打印候选检查增量和耗时；检查计数验证索引行为，耗时依赖本机环境。
 
@@ -83,14 +83,14 @@ const trimmed = await runtime.trim({
 });
 ```
 
-- size/cacheBytes 是可调准入目标，构造时的 pool.size/cacheBytes 是硬上限；size 至少为 1 和池 interactiveWorkers。降低 size 不终止忙碌 Worker或必需 Session，因此实际 Worker 数可能暂时高于目标。
+- size/cacheBytes 是可调准入目标，构造时的 pool.size/cacheBytes 是硬上限；size 至少为 1 和池 interactiveWorkers。降低 size 不终止忙碌 Worker或必需 Session，因此实际 Worker 数可能暂时高于目标。忙碌 Worker 结束任务后，会在再次准入前回收超额空闲 Worker；可回收 Session 还需等待排队任务、结果租约和清理结束。恢复容量会更新或取消待回收计划。
 - moderate 将进入压力前的容量约减半、缓存额度减半；critical 将准入容量降到池预留允许的最小值、缓存目标降到 0，并尝试回收全部空闲普通 Worker 和可回收 Session。normal 恢复进入压力前保存的目标，不预热 Worker，也不重建已关闭 reader。
 - trim 默认作用于全部池，cacheBytesPerWorker/workersPerPool 默认 0，reclaimSessions 默认 true；指定 false 保留所有 Session。trim 调低未来准入目标，但不暂停后续任务。压力期间的临时 resize/trim 不覆盖 normal 要恢复的原目标。
-- 回收遵守任务、结果租约、Session 准入与物理清理屏障。优先普通空闲 Worker，再按 reclaimPriority/最近使用时间选择允许回收的 Session。
+- 回收遵守任务、结果租约、Session 准入与物理清理屏障。普通缩容同时检查总数与非交互 Worker 上限；非交互数量超额时，先回收该类别，保留交互容量，普通 Worker 的复用也遵守新上限。满足类别约束后优先普通空闲 Worker，再按 reclaimPriority/最近使用时间选择允许回收的 Session。显式 trim/critical 仍可进一步回收低于准入下限的空闲 Worker。
 - 每次实际回收前重新确认候选仍然空闲；等待其他副本清理期间接到任务或持有结果的候选会被跳过。
 - cache 缩容先驱逐普通 LRU，再调用显式注册的资源 trim。回调应先销毁数据，再返回不大于原值的剩余额度；不要在回调中另行 resize。未注册回调的 pinned 资源保留。存活 pinned 状态超过目标时该 Worker 缩容失败，原 cache 预留保留。
 - 缩容收到 Host ACK 才归还全局 cache 额度；扩容先预留差额再发送控制消息。活跃任务结束前不会启动控制 ACK 超时。清理开始后未在 releaseTimeoutMs 内确认会隔离并终止该 Worker；物理终止失败仍保留全部占用。
-- 每次调用返回 MaintenanceReport：成功回收的 Worker 数、实际归还的 cache 额度与逐 Worker failures。部分失败不回滚已经完成的清理，目标与实际占用可通过 diagnostics 对照。并发维护调用被拒绝，应 await 前一次；Runtime 关闭后不接受新调用。
+- 每次调用返回 MaintenanceReport：调用期间成功回收的 Worker 数、实际归还的 cache 额度与逐 Worker failures。返回后延迟完成的缩容计入 stats.reclaim，失败通过 onDiagnostic 报告，物理终止前仍保留占用。部分失败不回滚已经完成的清理，目标与实际占用可通过 diagnostics 对照。并发维护调用被拒绝，应 await 前一次；Runtime 关闭后不接受新调用。
 
 压力级别由应用提供。Tasklane 不猜测浏览器可用内存，也不会扫描或释放应用未申报的主线程对象、GPU 内存。
 
@@ -108,9 +108,11 @@ const pool = {
 
 只在配置 adaptive 时启用。初始准入目标为下限，不预热。默认 minWorkers 是 max(1, interactiveWorkers)，minCacheBytes 为硬上限的四分之一，sampleMs 为 1000，idleMs 为 30000，missRatio 为 0.2。
 
+`size: 8, adaptive: {}` 通常从容量目标 1 开始，持续排队时每个采样周期最多增加 1，不能立即运行 8 项任务。需要一次突发即可使用全部容量时，省略 adaptive，或将 minWorkers 设为所需的初始容量；实际并发仍受全局 Worker、active 和预算上限约束，Worker 按需创建。
+
 每池按 sampleMs 采样：队列持续有等待时逐步增加一个 Worker 准入额度；有 miss 且发生驱逐或容量已满、miss 比例达到阈值时，cache 目标增加约 50%，不超过硬上限；空闲达到 idleMs 后回到下限，并依照同样的安全条件回收资源。反馈使用普通 CacheStore 与 reader 自报计数；缺少有效上报时无法判断 reader 的内部缓存收益。多池分别遵守自己的采样周期。
 
-同一轮中各池独立发起调整。自动缓存调整遇到忙碌或启动中的 Worker 会延后，待其空闲后再补齐到当前目标，避免一个长业务任务拖住其他池的采样。目标与实际 cacheReservedBytes 在此期间可以不同；显式 resize/pressure 仍等待相关清理完成。
+同一轮中各池独立发起调整。自动缓存调整遇到忙碌或启动中的 Worker 会延后，待其空闲后再补齐到当前目标，避免一个长业务任务拖住其他池的采样。扩容预算不足时保留目标与实际额度的差异，预算恢复后在后续采样中重试，无需新的缓存 miss；预算仍不足时不重复申请相同差额。目标与实际 cacheReservedBytes 在此期间可以不同；显式 resize/pressure 仍等待相关清理完成。
 
 该策略是有边界的启发式控制，不是最优配置计算。每次维护完成后才进行下一轮。非 normal 压力级别暂停自动调整，手动维护期间也不会启动重叠操作。失败通过 onDiagnostic 暴露，仍持有的资源可从诊断中查看。
 
@@ -129,7 +131,11 @@ const pool = {
 
 ## 本次验证记录
 
-2026-09-26：完整 verify 通过，包括 214 项 Node 测试、Chrome/Firefox/WebKit 合计 63 项真实 Worker 用例、类型/格式/lint 与离线安装 tarball 检查；另有 4 项大数据/取消压力测试通过。新增回归覆盖控制超时、终止失败保留额度、活跃任务与维护屏障、保护额度和副本失效回退。
+`0.2.0-beta.2` 发布检查：Node 22.23.1 与 24.19.0 各通过 236 项 Node 测试和 4 项大数据/取消压力测试；Chrome/Firefox/WebKit 合计 81 项通过。类型、格式、lint、包导出完整性和两个 Node 版本的离线安装 tarball 检查通过。数组编码新增回归及性能测量见 [测试与验收](testing.md) 和 [性能验证](performance.md)。
+
+2026-09-26 复审修复：231 项 Node 测试、Chrome/Firefox/WebKit 合计 78 项真实 Worker 用例、4 项大数据/取消压力测试，以及类型、格式、lint 和离线安装 tarball 检查全部通过。回归覆盖维护结束唤醒、忙碌 Worker 延迟缩容及恢复容量、结果租约/物理终止额度、交互类别预算保护与老化通道隔离、关闭待准入主 Session 所属 Scope 后唤醒副本。本轮新增 9 项 Node 与三浏览器合计 9 项用例，验证回收失败后惰性 Session 继续准入、空闲/忙碌/尚未创建交互 Worker 时的类别缩容、必需 Session 与显式 trim 的保护边界、预算归还后缓存达到原目标，以及截断或提前触发的计时器仍能建立预算防饥饿保护。100/1000/4000 个阻塞通道的基准中，100 个独立任务均只增加 100 次候选检查。
+
+0.2.0-beta.1 基线的完整 verify 包括 214 项 Node 测试、三浏览器合计 63 项真实 Worker 用例、类型/格式/lint 与离线安装 tarball 检查；另有 4 项大数据/取消压力测试通过。基线回归覆盖控制超时、终止失败保留额度、活跃任务与维护屏障、保护额度和副本失效回退。
 
 时间相关的 Node 回归使用可控时钟，验证多池独立采样、40 轮压力切换，以及 Session/Scope/Runtime 与缓存维护交错关闭。测试复现并修复了异步清理后的回收候选过期、忙碌 Worker 阻塞其他池自适应两处问题。
 
@@ -141,7 +147,7 @@ TASKLANE_SOAK_MS=60000 pnpm exec playwright test test/browser/maintenance.spec.m
 
 另外每个浏览器验证 12 次在 reader trim 开始后关闭 Session/Scope/Runtime 的清理屏障。该测试验证资源契约与有界持续运行，不等于生产环境长期 RSS 测量或实际 GIS 延迟评估。
 
-另行执行每个浏览器至少一分钟的持续测试，全部通过。合计 1367 轮负载、15856 个成功结果、548 次取消与 457 次压力循环；各浏览器结束时 Worker 数、任务/结果/资源租约与预留字节均归零。
+0.2.0-beta.1 基线另行执行每个浏览器至少一分钟的持续测试，全部通过。合计 1367 轮负载、15856 个成功结果、548 次取消与 457 次压力循环；各浏览器结束时 Worker 数、任务/结果/资源租约与预留字节均归零。复审修复后的完整浏览器测试运行上述默认持续时间，未重跑一分钟档。
 
 | 浏览器 | 持续负载轮数 | 成功结果 | 取消 | 压力循环 |
 | --- | ---: | ---: | ---: | ---: |
@@ -149,4 +155,4 @@ TASKLANE_SOAK_MS=60000 pnpm exec playwright test test/browser/maintenance.spec.m
 | Firefox | 430 | 4988 | 172 | 144 |
 | WebKit | 482 | 5590 | 194 | 161 |
 
-本机 blocked 基准：100、1000、4000 个阻塞通道下，独立池各执行 100 个任务，候选检查增量均为 100；本次耗时分别为 8.59、7.51、9.99 ms。这说明该场景没有随阻塞通道数反复全量检查，不代表 emap 的端到端性能结果。
+本机 blocked 基准：100、1000、4000 个阻塞通道下，独立池各执行 100 个任务，候选检查增量均为 100。本轮与其他测试并行复核了上述计数，不比较并行负载下的耗时。这说明该场景没有随阻塞通道数反复全量检查，不代表 emap 的端到端性能结果。

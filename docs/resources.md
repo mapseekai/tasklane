@@ -4,6 +4,8 @@
 
 `inputBytes` 和 `outputBytes` 按协议包大小预留和检查，计费覆盖字符串、数字、普通数组与对象图。根标量按 UTF-16 字符串字节、8 字节数字/64 位 BigInt、1 字节布尔值计费，null/undefined 为 0；根 buffer/view 按完整 backing store 计费。复合数据编码为有界的扁平图元数据、独立 buffer 列表和 File/Blob 附件表；费用为元数据字符串 UTF-16 字节、唯一 backing store 字节及附件引用费用。`packetByteLength(value)` 可以计算准确申报量；生成大型输入前应先声明安全上限，避免为了估算提前分配整个输入。
 
+普通数组的连续自有可枚举元素按位置编码，省去下标字符串；第一个空洞之后的元素与自定义属性保留显式键。解码复用 JSON 解析得到的数组并恢复引用，保留空洞、循环引用、别名、负零、非有限数字、undefined 与 BigInt。数组仍属于 JSON 图元数据，仍受对象数和遍历边上限约束。大量坐标宜使用 `{ op, xy: Float64Array }`：嵌套 TypedArray 的内容保留在独立二进制附件中。需要转移所有权时显式提供 `transfer: [xy.buffer]`；只传 TypedArray 不会自动转移。`packetByteLength` 本身会完整编码，应避免在每次发送前重复计算大型对象图。
+
 发送方在 postMessage 前编码并检查额度。Runtime 接收结果时检查封装和字节数；`lease.value` 首次访问时解码，后续复用同一值。结果可直接 release/discard，解码按 value 的访问需求进行。非法图在消费时抛错并自动释放租约。结果 byteLength 表示传输计费量；解码后的实际 JS 堆占用由应用结合运行环境测量。
 
 图编码限制为 100,000 个对象、1,000,000 条遍历边、4096 个 backing store、256 个 File/Blob 附件，以及 64 MiB 元数据与附件引用费用。数组长度、Map/Set 条目数在遍历前检查；对象和属性逐项遍历并检查工作量。消息支持标量、普通数据属性、数组、Map/Set、Date/RegExp、二进制 buffer/view 及 File/Blob 附件；自定义资源实例通过 Session setResource 管理。原生枚举和字符串编码产生的引擎临时内存由应用纳入实际内存评估。
@@ -24,7 +26,7 @@ Runtime 面向可信 Worker。使用 serve 在发送前校验协议消息和额�
 
 调度器按优先级、Scope/group 的服务历史选择任务，同一优先级、组、Pool/Session 通道内保持 FIFO。不同 Pool/Session 的阻塞头部互不遮挡。默认 `priorityPolicy: 'strict'`，可准入的 interactive 始终优先于 background。显式设置 `priorityPolicy: 'ageing'` 后，每 `ageingMs` 提升一级，后台最终可与交互任务同级。两种策略均在任务准入时决定顺序，已执行任务持续运行至完成或取消；严格优先级下低优先级任务可能长期等待。空闲组历史最多保留 4096 项，新组以当前服务时钟初始化，流式补充沿用服务历史参与公平调度。
 
-预算不足且等待达到 `budgetWaitMs`（默认 1000 ms）的可运行候选会阻止继续消耗其短缺额度的任务插队。其他额度上的工作仍可执行。等待用户释放结果、不可用 Session 或不可抢占的算法仍可能使任务超时。
+预算不足且等待达到 `budgetWaitMs`（默认 1000 ms）的可运行候选会阻止继续消耗其短缺额度的任务插队。判断同时考虑全局剩余额度和非交互类别的剩余额度；仅非交互额度不足时，不阻挡可使用交互预留的任务。其他额度上的工作仍可执行。等待用户释放结果、不可用 Session 或不可抢占的算法仍可能使任务超时。
 
 ## 结果与 Scope
 
@@ -67,11 +69,13 @@ context.progress 的发送生命周期随任务结束而关闭，结束后的 ch
 
 逻辑取消与物理阶段独立：启动期取消仍受 execution deadline 约束；已经发送的 Worker 任务到期会强制终止；prepare 采用同步构造契约。
 
-协议版本为 6，payload/result 使用 Packet 封装，request 携带 maxScratchBytes。自定义 endpoint 必须支持 progress ACK、Scope release ACK 和 cache-control/cache-controlled。主线程包与 Worker bundle 必须同步更新。底层传输和异步 disposer 的失败会传递给释放调用方，供其处理或重试。
+协议版本为 7，payload/result 使用 Packet 封装，request 携带 maxScratchBytes。v7 增加数组按位置编码；自定义 endpoint 必须支持该编码、progress ACK、Scope release ACK 和 cache-control/cache-controlled。主线程包与 Worker bundle 必须同步更新。底层传输和异步 disposer 的失败会传递给释放调用方，供其处理或重试。
 
 ## File/Blob 附件
 
 File/Blob 使用独立附件表；每个消息最多 256 个不同对象，重复引用按对象身份计一次，不同切片对象分别计费。`blobLimits.inputBytes/outputBytes` 默认 0，分别限制一个输入/输出消息中附件的逻辑大小总和，必须为非负安全整数。这些限制用于每包准入校验；同时保留的文件数量、逻辑大小总和及实际内存由应用管理。
+
+非空附件需要显式设置对应的 blobLimits；增大 budget.inputBytes/outputBytes 不会解除此限制。超额错误包含已统计的附件字节数、当前限额及需要设置的字段。空附件仍需足够的消息元数据预算。
 
 `packetByteLength` 与 inputBytes/outputBytes 计入图元数据、每附件 64 字节引用费用、MIME 字符串和二进制 backing store，附件内容的逻辑字节数由 blobLimits 单独校验。文件名与 lastModified 保存在图元数据中。编码通过附件引用保留文件内容；实际存储和克隆成本取决于浏览器或 Node 的实现。内存构造的 Blob 原有存储仍由应用负责。
 
@@ -80,6 +84,8 @@ File 的 name/type/lastModified 和重复引用得到保留；Blob/File 按原�
 读取后产生的 ArrayBuffer、解码临时内存和跨任务缓存仍需各自申报。ResultLease.release 清除租约持有的引用并返还消息额度；调用方另存的 File/Blob 由其持有者负责释放引用，底层存储由运行环境回收。完整示例见 [文件与分块使用指南](file-and-session.md)。
 
 ## 异步准备阶段
+
+`prepare` 与 `prepareAsync` 都在创建 Runtime 的调用线程执行，浏览器中通常是主线程。同步 prepare 已绑定 Worker 并占用 active 名额；prepareAsync 在绑定 Worker 前执行，但 async 函数中的同步解析、分配和计算仍会阻塞调用线程。异步 I/O 可使用 enqueuePrepared；CPU 密集工作应放入 Worker handler。
 
 `enqueuePrepared` 在调用 prepareAsync 前，原子预留任务 inputBytes、outputBytes 和 `max(preparationScratchBytes, budget.scratchBytes)`，并预占结果租约名额。该完整额度持续持有至物理任务结束，输出部分随后交给 ResultLease。准备临时数据在回调完成前释放，跨阶段保留的数据计入 inputBytes。此方式为准备到执行提供连续额度，业务使用声明的上界约束自身分配。
 

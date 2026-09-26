@@ -50,6 +50,8 @@ const chunks = iterateResults({
 });
 const iterator: AsyncIterableIterator<number> = chunks;
 void iterator;
+const cleanupRetry: Promise<void> = chunks.retryCleanup();
+void cleanupRetry;
 const info: RemoteErrorInfo = {
   name: 'DataError',
   message: 'failed',

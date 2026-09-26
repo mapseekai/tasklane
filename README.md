@@ -74,7 +74,7 @@ Session 适合需要长期绑定同一 Worker 的运行时：
 
 ## 安装与验证
 
-当前预发布版本为 `0.1.0-beta.3`，适合业务试点接入。仓库构建和 Node 示例需要 Node.js 22+ 与 pnpm，浏览器端使用 Web Worker。
+当前预发布版本为 `0.1.0-beta.4`，适合业务试点接入。仓库构建和 Node 示例需要 Node.js 22+ 与 pnpm，浏览器端使用 Web Worker。
 
 ```sh
 npm install @mapseekai/tasklane@beta

@@ -60,8 +60,33 @@ try {
  const chunks = [];
  for await (const chunk of iterator) chunks.push(chunk[0]);
  assert.deepEqual(chunks, [0]); await iterator.closed;
+ let closes = 0;
+ const cleanup = iterateResults({ next() { throw Error('unexpected pull'); }, isDone: () => false, close() { if (++closes === 1) throw Error('temporary close'); } });
+ await assert.rejects(cleanup.dispose(), /temporary close/); await cleanup.retryCleanup();
+ await assert.rejects(cleanup.closed, /temporary close/); assert.equal(closes, 2);
 } finally { await rt.dispose(); }
 assert.equal(rt.stats.workers, 0);
+import { createLoopback } from '@mapseekai/tasklane/testing';
+import { serve, output } from '@mapseekai/tasklane/host';
+let release, begin;
+const gate = new Promise((r) => { release = r; });
+const started = new Promise((r) => { begin = r; });
+const stops = [];
+const factory = () => { const link = createLoopback(); stops.push(serve(link.host, { async hold() { begin(); await gate; return output(null); }, ping() { return output(null); } })); return link.endpoint; };
+const scheduled = createWorkerRuntime({ pools: { busy: { factory, size: 1 }, idle: { factory, size: 1 } }, budgets: { scratchBytes: 100 }, budgetWaitMs: 1 });
+const owner = scheduled.createScope();
+const options = (pool, scratchBytes) => ({ pool, budget: { inputBytes: 0, scratchBytes, outputBytes: 0 }, prepare: () => ({ payload: null }) });
+try {
+ const running = owner.enqueue('hold', options('busy', 60)); await started;
+ const large = owner.enqueuePrepared('ping', { ...options('busy', 80), preparationScratchBytes: 80, prepareAsync: async () => ({ payload: null }) });
+ await new Promise((r) => setTimeout(r, 10));
+ const small = owner.enqueue('ping', options('idle', 20));
+ for (let i = 0; i < 100 && small.state !== 'succeeded'; i++) await new Promise((r) => setTimeout(r, 2));
+ assert.equal(small.state, 'succeeded'); await consumeResult(small, () => {});
+ assert.equal(running.state, 'running'); large.cancel(); await large.settled;
+ release(); await consumeResult(running, () => {});
+} finally { release(); await scheduled.dispose(); stops.forEach((stop) => stop()); }
+assert.equal(scheduled.stats.reserved.scratchBytes, 0);
 `,
   );
   await execute(process.execPath, ['smoke.mjs'], { cwd: directory, timeout: 15000 });

@@ -576,9 +576,17 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
               this.resultReservations + this.leaseCount >= this.options.maxResultLeases
             )
               return false;
-            if (this.reservation?.phase === 'done') this.reservation = undefined;
+            if (
+              this.reservation &&
+              (this.reservation.phase === 'done' || !this.canRun(this.reservation))
+            )
+              this.reservation = undefined;
             const reserved = this.reservation;
-            if (reserved && reserved !== candidate) {
+            if (
+              reserved &&
+              reserved !== candidate &&
+              this.scheduler.priority(candidate) >= this.scheduler.priority(reserved)
+            ) {
               const used = this.ledger.used,
                 limits = this.ledger.limits;
               const keys = ['inputBytes', 'scratchBytes', 'outputBytes'] as const;
@@ -593,7 +601,7 @@ export class WorkerRuntime<T extends Catalog<T> = TaskMap> {
               if (
                 !reserved &&
                 now - candidate.enqueuedAt >= this.options.budgetWaitMs &&
-                (producing || this.canRun(candidate))
+                this.canRun(candidate)
               )
                 this.reservation = candidate;
               return false;

@@ -18,6 +18,8 @@ Runtime 面向可信 Worker。使用 serve 在发送前校验协议消息和额�
 
 ## 调度
 
+等待预算的大任务在具备物理槽位准入条件时获得防饥饿保护；槽位条件变化后重新评估保留。预算保留约束同级和更低有效优先级任务，更高优先级任务仍可使用可用额度。ageing 模式按提升后的优先级比较。
+
 默认 `maxActiveTasks = min(pool capacity, maxWorkers)`，包括 Worker 启动、同步 prepare 和执行。等待队列默认最多 1024 项；生产者使用有限提交窗口可以控制业务侧 Promise 和闭包数量。
 
 调度器按优先级、Scope/group 的服务历史选择任务，同一优先级、组、Pool/Session 通道内保持 FIFO。不同 Pool/Session 的阻塞头部互不遮挡。默认 `priorityPolicy: 'strict'`，可准入的 interactive 始终优先于 background。显式设置 `priorityPolicy: 'ageing'` 后，每 `ageingMs` 提升一级，后台最终可与交互任务同级。两种策略均在任务准入时决定顺序，已执行任务持续运行至完成或取消；严格优先级下低优先级任务可能长期等待。空闲组历史最多保留 4096 项，新组以当前服务时钟初始化，流式补充沿用服务历史参与公平调度。
@@ -84,6 +86,10 @@ File 的 name/type/lastModified 和重复引用得到保留；Blob/File 按原�
 queueTimeoutMs 约束首次准入前的等待；executionTimeoutMs 从准备准入开始覆盖生产、等待 Worker、启动和执行；preparationTimeoutMs 单独约束生产回调，默认采用 executionTimeoutMs。取消/超时立即拒绝 result，回调物理结束后释放准备资源；迟到输入保持原缓冲区所有权。回调应通过 signal 协作退出并完成其临时资源清理。持续未完成的回调保持额度与清理屏障，可通过 disposeWithin 和 resourceDiagnostics 观察。
 
 stats.preparing / prepared 分别统计生产中和等待发送的输入；preparationReserved 展示这些输入持有的完整任务额度，已包含在 reserved 中。resourceDiagnostics 的 preparing / prepared 提供对应任务 ID。settled 在生产或 Worker 的物理生命周期结束后兑现。
+
+## 迭代器清理重试
+
+iterateResults 的 close 失败通过首次 closed 和触发清理的调用传播。retryCleanup() 显式再次调用 close，等待已提交任务 settled 后执行；并发重试共用同一次尝试。迭代停止后保持结束，业务任务和已消费块保持原状态。成功后的 dispose() 兑现；首次 closed 的失败记录保持可观察，重试完成以 retryCleanup() 为准。close 使用 Scope/Session 的释放接口时，常驻缓存与物理 Worker 额度仍由底层生命周期持有至释放确认。块租约在终止消费时释放，应用保留的块引用由应用管理。
 
 ## 业务错误
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-beta.4 — 2026-09-26
+
+- Budget starvation protection follows physical slot availability and effective task priority, including ageing.
+- Explicit result iterator cleanup retry with observable initial failure and shared in-flight cleanup.
+- Generic scheduling, Session occupancy, cancellation and cleanup regression coverage.
+
 ## 0.1.0-beta.3 — 2026-09-25
 
 - Protocol v5: structured, bounded remote business error metadata.

@@ -159,6 +159,10 @@ export class Scheduler<T extends ScheduledJob> {
     this.events.set(job, event);
     this.promotions.add(event);
   }
+  /** Effective rank after promotions processed by select: lower is higher priority. */
+  priority(job: T): number {
+    return this.membership.get(job)?.rank ?? 1;
+  }
   select(
     now: number,
     eligible: (job: T) => boolean,

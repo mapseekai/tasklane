@@ -649,6 +649,6 @@ await chunks.closed;
 
 示例使用应用定义的 next/closeCursor 任务、cursorId、chunkBudget、closeOptions 与 consumeChunk，并借用 session；closeOptions 应使用可执行清理的信号。helper 自建资源时可将 close 配置为所属 Scope/Session 的 dispose。
 
-`iterateResults<T>(ResultIterationOptions<T>)` 返回 `ResultIterator<T>`，支持 AsyncIterableIterator、dispose() 与 closed。isDone 为 true 的结束标记在内部释放；其他值逐块交给消费者。下一次 next、return、dispose 或 AbortSignal 都会结束当前租约。并发 next 以 INVALID_ARGUMENT 拒绝，消费者逐次请求即可保持单块在途。
+`iterateResults<T>(ResultIterationOptions<T>)` 返回 `ResultIterator<T>`，支持 AsyncIterableIterator、dispose()、retryCleanup() 与 closed。isDone 为 true 的结束标记在内部释放；其他值逐块交给消费者。下一次 next、return、dispose 或 AbortSignal 都会结束当前租约。并发 next 以 INVALID_ARGUMENT 拒绝，消费者逐次请求即可保持单块在途。
 
-break 和消费者异常通过迭代器 return 清理；手工 next 使用 finally + dispose。终止时取消当前请求并等待 settled，再调用 close 一次。closed 表示物理请求与清理完成，清理失败可通过该 Promise 观察。消费者保留块引用时需接管其内存预算。
+break 和消费者异常通过迭代器 return 清理；手工 next 使用 finally + dispose。终止时取消当前请求并等待 settled，再调用 close。closed 保存首次清理尝试的结果，失败可通过该 Promise 观察。显式调用 retryCleanup() 可重试失败的 close；重试期间 dispose() 与其他 retryCleanup() 共用进行中的尝试，成功后的调用直接完成。重试只执行资源清理，迭代保持结束；close 应支持部分完成后的重复调用。原 closed Promise 保留首次结果，以 retryCleanup() 返回值确认恢复。消费者保留块引用时需接管其内存预算。

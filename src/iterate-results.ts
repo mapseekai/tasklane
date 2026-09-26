@@ -11,9 +11,11 @@ export interface ResultIterationOptions<T> {
   signal?: AbortSignal;
 }
 export interface ResultIterator<T> extends AsyncIterableIterator<T> {
-  /** Physical task completion and cursor/resource cleanup; rejects if cleanup fails. */
+  /** Outcome of the first cleanup attempt; remains rejected after an explicit retry. */
   readonly closed: Promise<void>;
   dispose(): Promise<void>;
+  /** Explicitly retry failed close(), sharing any in-flight cleanup. Never pulls more data. */
+  retryCleanup(): Promise<void>;
 }
 
 /** One leased result at a time. next(), return(), dispose() and abort end the current lease. */
@@ -28,6 +30,9 @@ export function iterateResults<T>(options: ResultIterationOptions<T>): ResultIte
   let failed = false;
   let closing: Promise<void> | undefined;
   let submitting: Deferred<void> | undefined;
+  let cleanupFailed = false;
+  let stopReason: unknown;
+  let stopFailed = false;
   const stop = (reason?: unknown, hasFailure = reason !== undefined): Promise<void> => {
     if (ended) return closing ?? closed.promise;
     ended = true;
@@ -38,16 +43,25 @@ export function iterateResults<T>(options: ResultIterationOptions<T>): ResultIte
     task?.cancel(reason);
     lease?.release();
     lease = undefined;
+    stopReason = reason;
+    stopFailed = hasFailure;
+    return cleanup();
+  };
+  const cleanup = (): Promise<void> => {
+    cleanupFailed = false;
     closing = (async () => {
       try {
         await submitting?.promise;
         await task?.settled;
         await options.close();
+        failure = stopReason;
+        failed = stopFailed;
         closed.resolve();
       } catch (error) {
-        failure = !hasFailure
+        cleanupFailed = true;
+        failure = !stopFailed
           ? error
-          : new AggregateError([reason, error], 'Iteration and cleanup failed');
+          : new AggregateError([stopReason, error], 'Iteration and cleanup failed');
         failed = true;
         closed.reject(failure);
         throw failure;
@@ -126,5 +140,6 @@ export function iterateResults<T>(options: ResultIterationOptions<T>): ResultIte
       throw error;
     },
     dispose: () => stop(),
+    retryCleanup: () => (cleanupFailed ? cleanup() : stop()),
   };
 }

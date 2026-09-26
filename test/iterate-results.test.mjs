@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { iterateResults, consumeResult, RuntimeError } from '../dist/index.js';
+import { createWorkerRuntime, iterateResults, consumeResult, RuntimeError } from '../dist/index.js';
 import { deferred } from '../dist/runtime/deferred.js';
 import { runtime, options, sleep } from './helpers.mjs';
 
@@ -208,4 +208,119 @@ test('Session loss closes the iterator and returns outstanding credits', async (
   await iterator.closed;
   assert.equal(closes, 1);
   assert.equal(rt.stats.leases, 0);
+});
+
+test('explicit cleanup retry shares concurrent attempts and preserves the first closed outcome', async () => {
+  const gate = deferred();
+  let closes = 0,
+    pulls = 0;
+  const iterator = iterateResults({
+    next() {
+      pulls++;
+      throw Error('task failed');
+    },
+    isDone: () => false,
+    async close() {
+      if (++closes === 1) throw Error('temporary close failure');
+      await gate.promise;
+    },
+  });
+  const firstClosed = iterator.closed;
+  await assert.rejects(iterator.next(), AggregateError);
+  await assert.rejects(iterator.dispose(), AggregateError);
+  assert.equal(closes, 1);
+  const retry = iterator.retryCleanup();
+  assert.equal(iterator.retryCleanup(), retry);
+  assert.equal(iterator.dispose(), retry);
+  gate.resolve();
+  await retry;
+  assert.equal(iterator.closed, firstClosed);
+  await assert.rejects(firstClosed, AggregateError);
+  await assert.rejects(iterator.next(), /task failed/);
+  await iterator.retryCleanup();
+  await iterator.dispose();
+  assert.equal(closes, 2);
+  assert.equal(pulls, 1);
+});
+
+test('retry before iteration closes once without starting a request', async () => {
+  let closes = 0;
+  const iterator = iterateResults({
+    next() {
+      assert.fail('cleanup must not pull');
+    },
+    isDone: () => false,
+    close() {
+      closes++;
+    },
+  });
+  await iterator.retryCleanup();
+  await iterator.closed;
+  await iterator.retryCleanup();
+  assert.equal((await iterator.next()).done, true);
+  assert.equal(closes, 1);
+});
+
+test('cleanup retry retains Session worker and resident credits until resource disposal completes', async (t) => {
+  const { createLoopback } = await import('../dist/testing.js');
+  const { serve, output } = await import('../dist/host.js');
+  const gate = deferred();
+  let disposals = 0,
+    pulls = 0,
+    stop;
+  const rt = createWorkerRuntime({
+    pools: {
+      cpu: {
+        size: 1,
+        cacheBytes: 64,
+        idleTimeoutMs: 0,
+        factory() {
+          const link = createLoopback();
+          stop = serve(link.host, {
+            open(_value, context) {
+              context.cache.setResource('cursor', {}, 16, async () => {
+                if (++disposals === 1) throw Error('temporary disposer failure');
+                await gate.promise;
+              });
+              return output(null);
+            },
+          });
+          return link.endpoint;
+        },
+      },
+    },
+    budgets: { cacheBytes: 64 },
+  });
+  t.after(async () => {
+    gate.resolve();
+    await rt.dispose();
+    stop?.();
+  });
+  const scope = rt.createScope(),
+    session = scope.session('cpu');
+  const iterator = iterateResults({
+    next() {
+      pulls++;
+      return session.enqueue('open', options(null));
+    },
+    isDone: () => false,
+    close: () => scope.dispose(),
+  });
+  await iterator.next();
+  await assert.rejects(iterator.dispose(), /temporary disposer failure/);
+  await assert.rejects(iterator.closed, /temporary disposer failure/);
+  assert.equal(rt.stats.workers, 1);
+  assert.equal(rt.stats.reserved.cacheBytes, 64);
+  const retry = iterator.retryCleanup();
+  await sleep(5);
+  assert.equal(rt.stats.workers, 1);
+  assert.equal(rt.stats.reserved.cacheBytes, 64);
+  gate.resolve();
+  await retry;
+  assert.equal(rt.stats.workers, 0);
+  assert.equal(rt.stats.reserved.cacheBytes, 0);
+  assert.equal(rt.stats.leases, 0);
+  assert.equal(rt.stats.scopes, 0);
+  assert.equal(disposals, 2);
+  assert.equal(pulls, 1);
 });

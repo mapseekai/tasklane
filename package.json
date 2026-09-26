@@ -1,6 +1,6 @@
 {
   "name": "@mapseekai/tasklane",
-  "version": "0.1.0-beta.3",
+  "version": "0.1.0-beta.4",
   "description": "A bounded task runtime for Web Workers and worker_threads",
   "type": "module",
   "license": "MIT",

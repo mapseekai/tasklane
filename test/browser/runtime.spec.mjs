@@ -573,3 +573,88 @@ test('standalone example cancellation converges', async ({ page }) => {
   await expect(page.locator('#status')).toContainText('已释放 Worker：0；活跃任务：0');
   await expect(page.getByRole('button', { name: '开始转换' })).toBeEnabled();
 });
+
+test('budget protection respects occupied Workers and iterator cleanup retries explicitly', async ({
+  page,
+}) => {
+  const result = await page.evaluate(async () => {
+    const { createWorkerRuntime, browserWorker, consumeResult, iterateResults } = await import(
+      '/dist/index.js'
+    );
+    const factory = browserWorker('/test/fixtures/browser-worker.mjs');
+    const rt = createWorkerRuntime({
+      pools: { busy: { factory, size: 1 }, idle: { factory, size: 1 } },
+      budgets: { scratchBytes: 100 },
+      budgetWaitMs: 1,
+    });
+    const scope = rt.createScope();
+    const opts = (pool, scratchBytes, payload) => ({
+      pool,
+      budget: { inputBytes: 4096, scratchBytes, outputBytes: 4096 },
+      prepare: () => ({ payload }),
+    });
+    try {
+      // Warm both physical Workers so startup speed cannot decide the assertion.
+      await Promise.all(
+        ['busy', 'idle'].map((pool) =>
+          consumeResult(scope.enqueue('ping', opts(pool, 0, null)), () => {}),
+        ),
+      );
+      const running = scope.enqueue('wait', opts('busy', 60, { ms: 500 }));
+      while (running.state !== 'running') await new Promise((r) => setTimeout(r, 2));
+      const large = scope.enqueuePrepared('ping', {
+        ...opts('busy', 80, null),
+        preparationScratchBytes: 80,
+        prepareAsync: async () => ({ payload: null }),
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      await consumeResult(scope.enqueue('ping', opts('idle', 20, null)), () => {});
+      const state = running.state;
+      large.cancel();
+      await large.settled;
+      await consumeResult(running, () => {});
+      let attempts = 0;
+      const iterator = iterateResults({
+        next() {
+          throw Error('unexpected pull');
+        },
+        isDone: () => false,
+        async close() {
+          if (++attempts === 1) throw Error('temporary');
+          await scope.dispose();
+        },
+      });
+      let firstFailure;
+      try {
+        await iterator.dispose();
+      } catch (error) {
+        firstFailure = error.message;
+      }
+      await iterator.retryCleanup();
+      let closedFailure;
+      try {
+        await iterator.closed;
+      } catch (error) {
+        closedFailure = error.message;
+      }
+      return {
+        state,
+        attempts,
+        firstFailure,
+        closedFailure,
+        scopes: rt.stats.scopes,
+        scratch: rt.stats.reserved.scratchBytes,
+      };
+    } finally {
+      await rt.dispose();
+    }
+  });
+  expect(result).toEqual({
+    state: 'running',
+    attempts: 2,
+    firstFailure: 'temporary',
+    closedFailure: 'temporary',
+    scopes: 0,
+    scratch: 0,
+  });
+});
